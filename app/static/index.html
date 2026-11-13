@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ledgerline — Audit-Ready Close Commentary</title>
+<meta name="description" content="Reconcile, narrate and verify the financial close commentary before a human signs off." />
+<link rel="stylesheet" href="/static/styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230b5f6b'/><path d='M8 22V10h3v9h6v3H8zm11 0V10h3v12h-3z' fill='white'/></svg>" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark">LL</span>
+      <span class="brand-text">
+        <strong>Ledgerline</strong>
+        <em>Audit-ready close commentary</em>
+      </span>
+    </div>
+
+    <div class="topbar-context" id="topbar-context"></div>
+
+    <div class="topbar-actions">
+      <button class="btn btn-ghost" data-act="new-run" title="Reconcile, narrate and verify a fresh close">
+        <span class="dot dot-idle"></span> Run close
+      </button>
+      <div class="menu-wrap">
+        <button class="btn btn-primary" data-act="export" id="export-btn">Export evidence</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail"></aside>
+  <main class="main" id="main">
+    <div class="loading-card">
+      <div class="spinner"></div>
+      <p>Reconciling ledgers…</p>
+    </div>
+  </main>
+</div>
+
+<div class="drawer-scrim" id="drawer-scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Source figure detail"></aside>
+<div class="toast-stack" id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

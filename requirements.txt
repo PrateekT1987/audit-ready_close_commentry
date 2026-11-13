@@ -1,0 +1,4 @@
+fastapi>=0.115
+uvicorn>=0.30
+# Starlette's TestClient uses httpx2; only needed to run tests/test_ledgerline.py.
+httpx2>=0.27
