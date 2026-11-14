@@ -14,6 +14,7 @@ import os
 import tempfile
 import time
 import traceback
+from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
 
@@ -88,14 +89,15 @@ def test_parser_rejects_prose() -> None:
 def test_reconcile_invariants() -> None:
     stats = RECON["stats"]
     assert stats["entities"] == 4
-    assert stats["journal_lines"] == 1065
+    assert stats["journal_lines"] == 1072
     assert stats["accounts_in_scope"] == 20
     assert stats["variances"] == 76
     assert stats["material_variances"] == 12
     assert stats["pl_material"] == 11 and stats["bs_material"] == 1
-    assert stats["controls_run"] == 146
+    assert stats["controls_run"] == 151
     assert stats["controls_breaks"] == 3
     assert stats["facts"] == len(RECON["facts"]) == 862
+    assert stats["trial_balance_rows"] == 80
     assert len({f["fact_id"] for f in RECON["facts"]}) == 862
     assert all(f["derivation"] for f in RECON["facts"])
     # Every breaking control is a disclosed warning, never silently dropped.
@@ -103,12 +105,76 @@ def test_reconcile_invariants() -> None:
     assert len(breaks) == 3
     assert all(b["difference"] != "0.00" for b in breaks)
 
+    # The ledger itself is double-entry: every entity-period posts equal
+    # debits and credits, and each line carries exactly one side.
+    debits = defaultdict(Decimal)
+    credits = defaultdict(Decimal)
+    for line in RAW["journal"]:
+        key = (line["entity"], line["period"])
+        debits[key] += Decimal(line["debit"])
+        credits[key] += Decimal(line["credit"])
+    assert debits == credits
+    assert all(line["debit"] == "0.00" or line["credit"] == "0.00" for line in RAW["journal"])
+
+    # Every entity and the group prove: debit balances equal credit balances.
+    tb_controls = {c["check_id"]: c for c in RECON["integrity"] if c["kind"] == "trial_balance"}
+    assert set(tb_controls) == {"TB-US01", "TB-DE02", "TB-SG03", "TB-UK04", "TB-GRP"}
+    assert all(c["status"] == "pass" for c in tb_controls.values())
+    assert all(c["difference"] == "0.00" for c in tb_controls.values())
+
 
 def test_reconcile_is_deterministic() -> None:
     again = reconcile(RAW)
     assert again["stats"] == RECON["stats"]
     assert [v["variance_usd"] for v in again["variances"]] == [v["variance_usd"] for v in RECON["variances"]]
     assert [f["value"] for f in again["facts"]] == [f["value"] for f in RECON["facts"]]
+
+
+def test_trial_balance_breaks_block_the_run() -> None:
+    # A one-sided journal edit: the entity proof and the group proof break,
+    # a different entity stays clean, and the severity is blocking.
+    tampered = copy.deepcopy(RAW)
+    line = next(
+        l for l in tampered["journal"]
+        if l["entity"] == "US01" and l["account"] == "6000"
+        and l["period"] == "2026-10" and Decimal(l["amount"]) > 0
+    )
+    line["amount"] = str(Decimal(line["amount"]) + Decimal("1000.00"))
+    line["debit"] = str(Decimal(line["debit"]) + Decimal("1000.00"))
+    recon = reconcile(tampered)
+    by_id = {c["check_id"]: c for c in recon["integrity"]}
+    assert by_id["TB-US01"]["status"] == "break"
+    assert by_id["TB-US01"]["severity"] == "block"
+    assert by_id["TB-US01"]["difference"] != "0.00"
+    assert by_id["TB-GRP"]["status"] == "break"
+    assert by_id["TB-GRP"]["severity"] == "block"
+    assert by_id["TB-DE02"]["status"] == "pass"
+    assert recon["stats"]["controls_breaks"] == 5
+
+    # The block must reach the gate, not merely sit in the reconcile report.
+    verification = verify(tampered, recon, narrate(recon, mode="strict"))
+    assert verification["gate"]["status"] == "blocked"
+    assert verification["gate"]["signable"] is False
+    blocked_controls = {
+        f["control_id"] for f in verification["findings"]
+        if f["severity"] == "block" and f.get("control_id")
+    }
+    assert {"TB-US01", "TB-GRP"} <= blocked_controls
+
+    # A closing balance that no longer articulates with the period result
+    # must break the same proof, with the same blocking severity.
+    tampered = copy.deepcopy(RAW)
+    row = next(
+        r for r in tampered["bs_closing"]
+        if r["entity"] == "US01" and r["account"] == "1100" and r["period"] == "2026-10"
+    )
+    row["closing_local"] = str(Decimal(row["closing_local"]) + Decimal("2500.00"))
+    recon = reconcile(tampered)
+    by_id = {c["check_id"]: c for c in recon["integrity"]}
+    assert by_id["TB-US01"]["status"] == "break"
+    assert by_id["TB-US01"]["severity"] == "block"
+    assert by_id["TB-GRP"]["status"] == "break"
+    assert by_id["TB-GRP"]["severity"] == "block"
 
 
 # -------------------------------------------------------------- narrate

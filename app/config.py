@@ -65,7 +65,7 @@ class Account:
     code: str
     name: str
     short: str
-    cls: str          # revenue | cogs | opex | other | asset | liability
+    cls: str          # revenue | cogs | opex | other | asset | liability | equity
     statement: str    # PL | BS
     # Ledger convention below is debit-positive. Assets and expenses are
     # debit-normal (+1); revenue and liabilities are credit-normal (-1).
@@ -103,6 +103,16 @@ _ACCOUNTS: list[Account] = [
 
 ACCOUNTS: dict[str, Account] = {a.code: a for a in _ACCOUNTS}
 ACCOUNT_LIST = _ACCOUNTS
+
+# The chart above is the analytical scope: accounts that get facts, variances
+# and commentary. A trial balance also needs an equity line, otherwise the
+# balance sheet can never prove. Retained earnings is presented as a single
+# brought-forward balance (prior period net assets) and is deliberately kept
+# out of ACCOUNT_LIST so it does not enter the variance queue.
+RETAINED_EARNINGS = Account(
+    "3100", "Retained Earnings (brought forward)", "Retained Earnings",
+    "equity", "BS", -1, "neutral", "Retained earnings brought forward",
+)
 
 
 # ---------------------------------------------------------------------------

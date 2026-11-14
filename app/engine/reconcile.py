@@ -281,6 +281,18 @@ def _prior_derivation(ledger: Ledger, entity: str, account: str, period: str, cu
     }
 
 
+def _tb_columns(presented: Decimal, presentation_sign: int) -> tuple[Decimal, Decimal]:
+    """Split a presented balance into its debit and credit columns.
+
+    A positive balance sits on the account's normal side. A contra balance
+    (negative cash, a debit balance in deferred revenue) flips to the other
+    column, which is what makes the trial balance self-proving.
+    """
+    if presented >= 0:
+        return (presented, D(0)) if presentation_sign > 0 else (D(0), presented)
+    return (D(0), -presented) if presentation_sign > 0 else (-presented, D(0))
+
+
 def reconcile(dataset: dict) -> dict:
     ledger = Ledger(dataset)
     facts = FactStore()
@@ -296,6 +308,7 @@ def reconcile(dataset: dict) -> dict:
                 continue
             presented_local = ledger.presented_actual(code, account_code, period)
             rate = ledger.rate(code, period)
+            debit_local, credit_local = _tb_columns(presented_local, ACCOUNTS[account_code].presentation_sign)
             trial_balance.append({
                 "entity": code,
                 "entity_name": entity["name"],
@@ -307,7 +320,48 @@ def reconcile(dataset: dict) -> dict:
                 "line_count": len(lines),
                 "presented_local": str(presented_local),
                 "presented_usd": str(q2(presented_local * rate)),
+                # Unrounded USD columns keep the control exact: each entity's
+                # local debits and credits are equal to the cent, so their
+                # translated totals are equal too.
+                "debit_local": str(q2(debit_local)),
+                "credit_local": str(q2(credit_local)),
+                "debit_usd": str(debit_local * rate),
+                "credit_usd": str(credit_local * rate),
             })
+
+        # Brought-forward equity: prior-period net assets. The current-period
+        # P&L is still open in the trial balance, so equity is the opening
+        # balance and assets - liabilities = equity + current result.
+        assets_prior = sum(
+            (ledger.closing_local(code, a.code, prior_period) or D(0)
+             for a in config.ACCOUNT_LIST if a.statement == "BS" and a.cls == "asset"),
+            D(0),
+        )
+        liabilities_prior = sum(
+            (ledger.closing_local(code, a.code, prior_period) or D(0)
+             for a in config.ACCOUNT_LIST if a.statement == "BS" and a.cls == "liability"),
+            D(0),
+        )
+        retained_local = q2(assets_prior - liabilities_prior)
+        rate = ledger.rate(code, period)
+        equity = config.RETAINED_EARNINGS
+        debit_local, credit_local = _tb_columns(retained_local, equity.presentation_sign)
+        trial_balance.append({
+            "entity": code,
+            "entity_name": entity["name"],
+            "account": equity.code,
+            "account_name": equity.name,
+            "statement": equity.statement,
+            "currency": entity["currency"],
+            "rate": str(rate),
+            "line_count": 0,
+            "presented_local": str(retained_local),
+            "presented_usd": str(q2(retained_local * rate)),
+            "debit_local": str(q2(debit_local)),
+            "credit_local": str(q2(credit_local)),
+            "debit_usd": str(debit_local * rate),
+            "credit_usd": str(credit_local * rate),
+        })
 
     # ---- 2. Facts for every actual and plan figure -----------------------
     actual_facts: dict[tuple[str, str], str] = {}
@@ -719,6 +773,36 @@ def reconcile(dataset: dict) -> dict:
             severity_if_break="warn",
             note="Active accounts have postings in every period of the quarter.",
         )
+
+    # 4g. Trial balance proof: debit balances must equal credit balances.
+    # A trial balance that does not prove is not a disclosed exception, it is
+    # a broken ledger. Both the entity and group controls block on any break.
+    for entity in dataset["entities"]:
+        code = entity["code"]
+        rows = [r for r in trial_balance if r["entity"] == code]
+        total_debit = sum((D(r["debit_usd"]) for r in rows), D(0))
+        total_credit = sum((D(r["credit_usd"]) for r in rows), D(0))
+        control(
+            check_id=f"TB-{code}",
+            kind="trial_balance",
+            target=f"{code} trial balance {period}",
+            expected=total_debit,
+            actual=total_credit,
+            severity_if_break="block",
+            note="Total debit balances equal total credit balances, including retained earnings brought forward.",
+        )
+
+    total_debit = sum((D(r["debit_usd"]) for r in trial_balance), D(0))
+    total_credit = sum((D(r["credit_usd"]) for r in trial_balance), D(0))
+    control(
+        check_id="TB-GRP",
+        kind="trial_balance",
+        target=f"group trial balance {period}",
+        expected=total_debit,
+        actual=total_credit,
+        severity_if_break="block",
+        note="Consolidated debit balances equal consolidated credit balances at closing rates.",
+    )
 
     breaks = [c for c in integrity if c["status"] == "break"]
     material_variances = [v for v in variances if v["material"]]

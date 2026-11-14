@@ -35,11 +35,11 @@ store into one hash-chained audit record.
 ### 1. Reconcile
 
 `app/engine/reconcile.py` builds the trial balance, translates local balances
-at closing rates, computes plan variances, runs 146 controls (roll-forward,
-subledger tie-out, intercompany elimination, FX completeness, period
-completeness) and emits **862 facts**. Each fact carries its own derivation:
-which journal lines, which plan row, which FX rate, and how it was signed for
-presentation.
+at closing rates, computes plan variances, runs 151 controls (trial-balance
+proof, roll-forward, subledger tie-out, intercompany elimination, FX
+completeness, period completeness) and emits **862 facts**. Each fact carries
+its own derivation: which journal lines, which plan row, which FX rate, and
+how it was signed for presentation.
 
 Variances are decomposed into named drivers. The attribution must sum exactly
 to the variance; a residual is a control failure, not a rounding note.
@@ -129,7 +129,8 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-18 tests cover the money round-trip, reconcile invariants, fact-bound
+19 tests cover the money round-trip, reconcile invariants, the blocking
+trial-balance proof, fact-bound
 narration, the clean and adversarial verification outcomes, the six-mutation
 self-test, sign-off refusal, chain tamper detection, evidence-pack manifests
 and the HTTP surface. No pytest dependency.
@@ -199,10 +200,12 @@ tests/test_ledgerline.py
 ## Demo dataset
 
 Acme Global Holdings, four entities (US01 USD, DE02 EUR, SG03 SGD, UK04 GBP),
-four periods (2026-07 through 2026-10), 20 accounts, 1,065 journal lines, 76
-account variances (12 material: 11 P&L, 1 balance sheet), 146 controls with
+four periods (2026-07 through 2026-10), 20 accounts, 1,072 journal lines, 76
+account variances (12 material: 11 P&L, 1 balance sheet), 151 controls with
 three deliberate warn-level breaks (SG03 cash subledger, IC-01 and IC-02
-intercompany timing/FX differences), and 862 facts.
+intercompany timing/FX differences), and 862 facts. The ledger is double-entry
+and every entity trials balance; `TB-{entity}` and `TB-GRP` block rather than
+warn, so an unbalanced ledger can never reach sign-off.
 
 Everything is synthetic and seeded deterministically; no customer data is
 included.

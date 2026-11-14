@@ -277,11 +277,47 @@ def build_dataset() -> dict:
                 closing[(code, account_code, period)] = value
 
     # Overwrite the closed periods so the current month reconciles exactly to
-    # the stated base balances (no noise on October).
+    # the stated base balances (no noise on October). Cash is re-articulated
+    # below; its base is only the starting point for the opening balance sheet.
     for entity in ENTITIES:
         code = entity.code
         for account_code, base in BASE_BS[code].items():
             closing[(code, account_code, "2026-10")] = D(base)
+
+    # ---- Articulate the balance sheet ------------------------------------
+    # The ledger is double-entry: every entity-period must post equal debits
+    # and credits. P&L lines are generated from plan + drivers, while the
+    # balance-sheet lines are the movements in closing balances. Cash is the
+    # balancing asset: set its closing so the movement in net assets equals
+    # the period result. Retained earnings brought forward then accumulates
+    # those results and the trial balance proves without a plug in reconcile.
+    profit: dict[tuple[str, str], Decimal] = {}
+    for entity in ENTITIES:
+        code = entity.code
+        for period in PERIODS:
+            ledger_total = D(0)
+            for account_code in BASE_BUDGET[code]:
+                account = ACCOUNTS[account_code]
+                budget = D(plan_rows[(code, account_code, period)]["budget_local"])
+                presented_actual = budget + driver_total_local(code, account_code, period)
+                ledger_total += presented_actual * account.presentation_sign
+            profit[(code, period)] = q2(-ledger_total)
+
+    for entity in ENTITIES:
+        code = entity.code
+        asset_accounts = [a for a in BASE_BS[code] if ACCOUNTS[a].cls == "asset"]
+        liability_accounts = [a for a in BASE_BS[code] if ACCOUNTS[a].cls == "liability"]
+        non_cash_assets = [a for a in asset_accounts if a != "1000"]
+
+        equity = q2(
+            sum((closing[(code, a, "2026-06")] for a in asset_accounts), D(0))
+            - sum((closing[(code, l, "2026-06")] for l in liability_accounts), D(0))
+        )
+        for period in PERIODS:
+            equity = q2(equity + profit[(code, period)])
+            non_cash = sum((closing[(code, a, period)] for a in non_cash_assets), D(0))
+            liabilities = sum((closing[(code, l, period)] for l in liability_accounts), D(0))
+            closing[(code, "1000", period)] = q2(liabilities + equity - non_cash)
 
     # Budget for balance-sheet accounts = closing less the driver total, so the
     # variance is fully attributed the same way P&L variances are. All plan and
