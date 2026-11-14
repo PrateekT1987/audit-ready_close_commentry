@@ -8,6 +8,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from app.engine.audit import signoff_sequence
+
 DB_PATH = os.environ.get("FINCOM_DB", "data/close.db")
 DATASET_PATH = os.environ.get("FINCOM_DATASET", "data/dataset.json")
 
@@ -119,17 +121,22 @@ def load_signoffs(run_id: str | None = None) -> list[dict]:
     with connect() as connection:
         if run_id:
             rows = connection.execute(
-                "SELECT record FROM signoffs WHERE run_id = ? ORDER BY signed_at", (run_id,)
+                "SELECT record FROM signoffs WHERE run_id = ?", (run_id,)
             ).fetchall()
         else:
-            rows = connection.execute("SELECT record FROM signoffs ORDER BY signed_at").fetchall()
-    return [json.loads(row["record"]) for row in rows]
+            rows = connection.execute("SELECT record FROM signoffs").fetchall()
+    records = [json.loads(row["record"]) for row in rows]
+    # Chain order is the persisted sequence, never the second-resolution
+    # timestamp. Sorting here keeps every caller (new signoffs, views, the
+    # audit endpoint) on the same order.
+    records.sort(key=lambda r: (signoff_sequence(r), str(r.get("signoff_id", ""))))
+    return records
 
 
 def next_sequence() -> int:
     with connect() as connection:
-        row = connection.execute("SELECT COUNT(*) AS n FROM signoffs").fetchone()
-    return int(row["n"]) + 1
+        rows = connection.execute("SELECT record FROM signoffs").fetchall()
+    return max((signoff_sequence(json.loads(row["record"])) for row in rows), default=0) + 1
 
 
 def log_event(run_id: str, actor: str, action: str, detail: dict | None = None) -> None:

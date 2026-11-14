@@ -298,7 +298,8 @@ def test_chain_links_and_detects_tamper() -> None:
     }
     chain = audit.verify_chain([first, second], runs)
     assert [c["status"] for c in chain] == ["intact", "intact"]
-    assert chain[1]["link_ok"] and chain[1]["hash_ok"] and chain[1]["content_ok"]
+    assert [c["sequence"] for c in chain] == [1, 2]
+    assert chain[1]["link_ok"] and chain[1]["hash_ok"] and chain[1]["sequence_ok"] and chain[1]["content_ok"]
 
     tampered = json.loads(json.dumps(STRICT))
     tampered["sections"][0]["paragraphs"][0]["tokens"][0]["v"] += " (edited)"
@@ -311,6 +312,79 @@ def test_chain_links_and_detects_tamper() -> None:
     broken = json.loads(json.dumps(second))
     broken["chain_hash"] = "0" * 64
     assert audit.verify_chain([first, broken], runs)[1]["hash_ok"] is False
+
+
+def test_chain_order_is_sequence_not_wall_clock() -> None:
+    first = _sign("run_a", "genesis", 1)
+    second = _sign("run_b", first["chain_hash"], 2)
+
+    # Reversed input order must not reverse the chain.
+    reversed_chain = audit.verify_chain([second, first], {})
+    assert [c["signoff_id"] for c in reversed_chain] == ["SO-0001", "SO-0002"]
+    assert [c["status"] for c in reversed_chain] == ["intact", "intact"]
+
+    # Two signoffs in the same second are still ordered by sequence.
+    same_a = copy.deepcopy(first)
+    same_b = copy.deepcopy(second)
+    same_a["signed_at"] = same_b["signed_at"] = "2026-11-14T10:00:00+00:00"
+    ordered = audit.verify_chain([same_b, same_a], {})
+    assert [c["signoff_id"] for c in ordered] == ["SO-0001", "SO-0002"]
+
+    # Timestamp tampering cannot move a record ahead of its predecessor.
+    swapped_a = copy.deepcopy(first)
+    swapped_b = copy.deepcopy(second)
+    swapped_a["signed_at"] = "2026-11-14T10:00:02+00:00"
+    swapped_b["signed_at"] = "2026-11-14T10:00:01+00:00"
+    ordered = audit.verify_chain([swapped_b, swapped_a], {})
+    assert [c["signoff_id"] for c in ordered] == ["SO-0001", "SO-0002"]
+    assert all(c["hash_ok"] is False for c in ordered)
+    assert all(c["status"] == "broken" for c in ordered)
+
+    # A rewritten sequence changes both the committed payload and the order.
+    tampered = copy.deepcopy(second)
+    tampered["sequence"] = 1
+    tampered["signoff_id"] = "SO-0001"
+    result = audit.verify_chain([first, tampered], {})
+    assert result[1]["hash_ok"] is False
+    assert result[1]["sequence_ok"] is False
+    assert result[1]["status"] == "broken"
+
+
+def test_legacy_signoff_without_sequence_still_verifies() -> None:
+    record = _sign("run_a", "genesis", 1)
+    legacy = copy.deepcopy(record)
+    legacy.pop("sequence")
+    legacy["chain_hash"] = audit.digest({
+        "prev": legacy["prev_chain_hash"],
+        "run_id": legacy["run_id"],
+        "content": legacy["hashes"]["content_hash"],
+        "verification": legacy["hashes"]["verification_hash"],
+        "facts": legacy["hashes"]["fact_store_hash"],
+        "signer": legacy["signer"],
+        "signed_at": legacy["signed_at"],
+    })
+    result = audit.verify_chain([legacy], {})
+    assert result[0]["sequence"] == 1
+    assert result[0]["sequence_ok"] is True
+    assert result[0]["status"] == "intact"
+
+
+def test_store_loads_signoffs_in_sequence_order() -> None:
+    original_path = store.DB_PATH
+    store.DB_PATH = str(_TMP / "sequence-order.db")
+    try:
+        first = _sign("run_a", "genesis", 1)
+        second = _sign("run_b", first["chain_hash"], 2)
+        # Insert in reverse order, both stamped with the same second.
+        for record in (second, first):
+            record = copy.deepcopy(record)
+            record["signed_at"] = "2026-11-14T10:00:00+00:00"
+            store.save_signoff(record)
+        loaded = store.load_signoffs()
+        assert [r["signoff_id"] for r in loaded] == ["SO-0001", "SO-0002"]
+        assert store.next_sequence() == 3
+    finally:
+        store.DB_PATH = original_path
 
 
 def test_fact_hash_commits_to_full_derivation() -> None:

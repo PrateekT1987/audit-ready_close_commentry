@@ -30,6 +30,45 @@ def digest(payload) -> str:
     return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
 
 
+def signoff_sequence(record: dict) -> int:
+    """The chain position of a sign-off record.
+
+    New records persist `sequence` explicitly. Older records (signed before
+    the field existed) are still recoverable from the SO-#### identifier, so
+    both forms order deterministically without consulting a second-resolution
+    timestamp.
+    """
+    sequence = record.get("sequence")
+    if isinstance(sequence, int) and sequence > 0:
+        return sequence
+    signoff_id = str(record.get("signoff_id", ""))
+    prefix, _, suffix = signoff_id.rpartition("-")
+    if prefix == "SO" and suffix.isdigit():
+        return int(suffix)
+    return 0
+
+
+def _chain_payload(record: dict) -> dict:
+    """The exact fields committed to by `chain_hash`.
+
+    `sequence` is part of the payload for records that carry it, so moving a
+    record or rewriting its position invalidates the hash. Legacy records keep
+    their original payload (no sequence field) and remain verifiable.
+    """
+    payload = {
+        "prev": record["prev_chain_hash"],
+        "run_id": record["run_id"],
+        "content": record["hashes"]["content_hash"],
+        "verification": record["hashes"]["verification_hash"],
+        "facts": record["hashes"]["fact_store_hash"],
+        "signer": record["signer"],
+        "signed_at": record["signed_at"],
+    }
+    if "sequence" in record:
+        payload["sequence"] = record["sequence"]
+    return payload
+
+
 def _variance_core(recon: dict) -> list[dict]:
     fields = (
         "variance_id", "entity", "account", "statement", "period",
@@ -154,6 +193,7 @@ def sign(
     artefact_hashes = hashes(recon, commentary, verification)
     record = {
         "signoff_id": f"SO-{sequence:04d}",
+        "sequence": sequence,
         "run_id": run["id"],
         "period": recon["period"],
         "signer": signer.strip(),
@@ -177,17 +217,9 @@ def sign(
         },
         "hashes": artefact_hashes,
         "prev_chain_hash": prev_chain_hash,
-        "chain_hash": digest({
-            "prev": prev_chain_hash,
-            "run_id": run["id"],
-            "content": artefact_hashes["content_hash"],
-            "verification": artefact_hashes["verification_hash"],
-            "facts": artefact_hashes["fact_store_hash"],
-            "signer": signer.strip(),
-            "signed_at": signed_at,
-        }),
         "narrative_mode": commentary["mode"],
     }
+    record["chain_hash"] = digest(_chain_payload(record))
     return record
 
 
@@ -202,18 +234,19 @@ def verify_chain(signoffs: list[dict], runs: dict[str, dict] | None = None) -> l
     runs = runs or {}
     results: list[dict] = []
     previous = "genesis"
-    for record in sorted(signoffs, key=lambda r: r["signed_at"]):
-        expected = digest({
-            "prev": record["prev_chain_hash"],
-            "run_id": record["run_id"],
-            "content": record["hashes"]["content_hash"],
-            "verification": record["hashes"]["verification_hash"],
-            "facts": record["hashes"]["fact_store_hash"],
-            "signer": record["signer"],
-            "signed_at": record["signed_at"],
-        })
+    previous_sequence = 0
+    # Sequence is the chain key. `signed_at` is wall-clock metadata at second
+    # resolution and cannot order two signoffs made in the same second.
+    ordered = sorted(signoffs, key=lambda r: (signoff_sequence(r), str(r.get("signoff_id", ""))))
+    for record in ordered:
+        sequence = signoff_sequence(record)
+        expected = digest(_chain_payload(record))
         link_ok = record["prev_chain_hash"] == previous
         hash_ok = expected == record["chain_hash"]
+        sequence_ok = (
+            sequence == previous_sequence + 1
+            and record.get("signoff_id") == f"SO-{sequence:04d}"
+        )
         content_ok = True
         source_run = runs.get(record["run_id"])
         if source_run is not None:
@@ -225,16 +258,19 @@ def verify_chain(signoffs: list[dict], runs: dict[str, dict] | None = None) -> l
             )
         results.append({
             "signoff_id": record["signoff_id"],
+            "sequence": sequence,
             "run_id": record["run_id"],
             "signer": record["signer"],
             "signed_at": record["signed_at"],
             "chain_hash": record["chain_hash"],
             "link_ok": link_ok,
             "hash_ok": hash_ok,
+            "sequence_ok": sequence_ok,
             "content_ok": content_ok,
-            "status": "intact" if (link_ok and hash_ok and content_ok) else "broken",
+            "status": "intact" if (link_ok and hash_ok and sequence_ok and content_ok) else "broken",
         })
         previous = record["chain_hash"]
+        previous_sequence = sequence
     return results
 
 

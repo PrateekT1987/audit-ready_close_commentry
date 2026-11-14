@@ -95,8 +95,10 @@ contains:
   source reference — so repointing a fact at different evidence cannot leave
   the certificate intact,
 * the attestations and the signer's note,
+* a monotonic sequence number (`SO-0001`, `SO-0002`, …) that orders the chain
+  independently of the second-resolution wall-clock timestamp,
 * the previous record's chain hash,
-* a chain hash over all of the above.
+* a chain hash over all of the above, including the sequence.
 
 The audit trail re-hashes the live artefacts when it verifies the chain, so an
 edit to signed commentary, verification or facts is detected as a broken link —
@@ -129,8 +131,8 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-19 tests cover the money round-trip, reconcile invariants, the blocking
-trial-balance proof, fact-bound
+22 tests cover the money round-trip, reconcile invariants, the blocking
+trial-balance proof, sequence-ordered chain verification, fact-bound
 narration, the clean and adversarial verification outcomes, the six-mutation
 self-test, sign-off refusal, chain tamper detection, evidence-pack manifests
 and the HTTP surface. No pytest dependency.
