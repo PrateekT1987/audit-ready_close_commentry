@@ -124,7 +124,7 @@ def _summary_section(agg: dict[str, dict], facts: dict[str, dict], period: str) 
     p3.t("EBITDA of ").money(facts[ebitda["fact_ids"]["actual"]])
     p3.t(" carries the same movement, and net income closed at ").money(facts[ni["fact_ids"]["actual"]])
     p3.t(f", {_direction(ni['value_usd']['variance'])} plan by ").money(facts[ni["fact_ids"]["variance"]], absolute=True)
-    p3.t(". The gap to plan at group level is fully explained by the entity variances set out below; no group-level unallocated item has been booked in the period.")
+    p3.t(". The entity variances set out below are the material movements behind the group gap to plan; items below the review threshold are not individually narrated.")
 
     return {
         "section_id": "S-01",
@@ -177,15 +177,26 @@ def _variance_section(variance: dict, facts: dict[str, dict], index: int) -> dic
     p2 = Paragraph("attribution")
     drivers = [d for d in variance["drivers"] if D(d["amount"]) != 0]
     if drivers:
+        # The largest attributed driver is named explicitly, so the prose makes
+        # a claim the verifier can check against the arithmetic.
+        primary = drivers[0]
         p2.t("Attribution: ")
-        for position, driver in enumerate(drivers):
-            if position:
-                p2.t(", " if position < len(drivers) - 1 else " and ")
-            p2.t(f"{driver['cause']} contributes ")
-            if D(driver["amount"]) >= 0:
-                p2.money(facts[driver["fact_id"]])
-            else:
-                p2.t("an offset of ").money(facts[driver["fact_id"]], absolute=True)
+        p2.t(f"{primary['cause']} is the primary driver, contributing ")
+        if D(primary["amount"]) >= 0:
+            p2.money(facts[primary["fact_id"]])
+        else:
+            p2.t("an offset of ").money(facts[primary["fact_id"]], absolute=True)
+        rest = drivers[1:]
+        if rest:
+            p2.t("; ")
+            for position, driver in enumerate(rest):
+                if position:
+                    p2.t(", " if position < len(rest) - 1 else " and ")
+                p2.t(f"{driver['cause']} contributes ")
+                if D(driver["amount"]) >= 0:
+                    p2.money(facts[driver["fact_id"]])
+                else:
+                    p2.t("an offset of ").money(facts[driver["fact_id"]], absolute=True)
         p2.t(". The attribution sums exactly to the variance, leaving no unexplained residual.")
     else:
         p2.t("No driver attribution has been recorded against this variance; the movement is treated as unexplained and requires management input.")

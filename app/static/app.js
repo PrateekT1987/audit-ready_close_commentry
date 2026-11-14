@@ -235,6 +235,7 @@ function renderRail() {
       <div class="rail-kv"><span>${run.status === "signed" ? "Warnings attested" : "Warnings to attest"}</span><span class="${verification.gate.warnings && run.status !== "signed" ? "down" : "up"}">${verification.gate.warnings}</span></div>
       <div class="rail-kv"><span>Coverage</span><span>${verification.stats.coverage_covered}/${verification.stats.coverage_total}</span></div>
       <div class="rail-kv"><span>Attribution closure</span><span>${verification.stats.closure_passed}/${verification.stats.closure_checks}</span></div>
+      <div class="rail-kv"><span>Cross-section drivers</span><span>${verification.cross_section ? `${verification.cross_section.passed}/${verification.cross_section.total}` : "—"}</span></div>
       <div class="rail-kv"><span>Verifier self-test</span><span>${verification.self_test.detected}/${verification.self_test.total}</span></div>
     </div>
 
@@ -689,6 +690,7 @@ function renderVerify() {
   const { verification, recon } = S.run;
   const gate = verification.gate;
   const findings = verification.findings;
+  const cross = verification.cross_section || null;
 
   const findingRows = findings.filter((f) => {
     if (S.verifyFilter === "all") return true;
@@ -779,12 +781,13 @@ function renderVerify() {
       </div>
     </div>`}
 
-    <div class="kpis" style="grid-template-columns:repeat(5,minmax(0,1fr))">
+    <div class="kpis" style="grid-template-columns:repeat(${cross ? 6 : 5},minmax(0,1fr))">
       ${[
         ["Figures tied to source", `${verification.stats.figures_passed}<small>/ ${verification.stats.figures_checked}</small>`, verification.stats.figures_passed === verification.stats.figures_checked ? "pass" : "block", "parse-back + source match"],
         ["Source figures re-derived", `${verification.stats.facts_passed}<small>/ ${verification.stats.facts_checked}</small>`, verification.stats.facts_passed === verification.stats.facts_checked ? "pass" : "block", "ledger · plan · FX"],
         ["Attribution closure", `${verification.stats.closure_passed}<small>/ ${verification.stats.closure_checks}</small>`, verification.stats.closure_passed === verification.stats.closure_checks ? "pass" : "block", "no unexplained residual"],
         ["Coverage", `${verification.stats.coverage_covered}<small>/ ${verification.stats.coverage_total}</small>`, verification.stats.coverage_covered === verification.stats.coverage_total ? "pass" : "block", "material variances narrated"],
+        ...(cross ? [["Cross-section drivers", `${cross.passed}<small>/ ${cross.total}</small>`, cross.passed === cross.total ? "pass" : "block", "driver totals · prose claims"]] : []),
         ["Control test", `${verification.self_test.detected}<small>/ ${verification.self_test.total}</small>`, verification.self_test.passed ? "pass" : "block", "injected defects caught"],
       ].map(([label, value, cls, foot]) => `
         <div class="kpi ${cls}"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${value}</div><div class="kpi-foot">${esc(foot)}</div></div>`).join("")}
@@ -873,6 +876,47 @@ function renderVerify() {
         </div>
       </div>
     </div>
+
+    ${cross ? `
+    <div class="card">
+      <div class="card-hd"><h2>Cross-section reconciliation</h2><span class="hd-note">${cross.passed}/${cross.total} driver and claim checks tie</span></div>
+      <div class="card-bd tight">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Driver</th><th class="num">Cited across sections</th><th class="num">Reconciled total</th><th class="num">Difference</th><th>Check</th></tr></thead>
+            <tbody>
+              ${cross.driver_totals.map((r) => `
+                <tr>
+                  <td>${esc(r.label)} <span class="mono xsmall muted">${esc(r.driver)}</span></td>
+                  <td class="num">${money(r.cited_usd, { signed: true })}</td>
+                  <td class="num">${money(r.expected_usd, { signed: true })}</td>
+                  <td class="num">${money(r.difference_usd, { signed: true })}</td>
+                  <td><span class="tag ${r.status === "pass" ? "tag-pass" : "tag-block"}">${esc(r.status)}</span></td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      ${cross.claims.some((c) => c.status !== "pass") ? `
+      <div class="card-bd tight" style="border-top:1px solid var(--line)">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Section</th><th>Prose claim</th><th>Arithmetic expected</th><th>Prose arithmetic</th><th>Check</th></tr></thead>
+            <tbody>
+              ${cross.claims.filter((c) => c.status !== "pass").map((c) => `
+                <tr>
+                  <td class="mono small">${esc(c.section_id)}</td>
+                  <td>${esc(c.claim)}</td>
+                  <td class="mono small">${esc(c.expected)}</td>
+                  <td class="mono small">${esc(c.actual)}</td>
+                  <td><span class="tag tag-block">fail</span></td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>` : ""}
+      <div class="card-ft"><span>${cross.claims.length} prose claims — primary cause, complete attribution and entire-movement language — checked against the arithmetic behind the sections.</span></div>
+    </div>` : ""}
   `;
 }
 

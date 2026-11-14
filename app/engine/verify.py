@@ -1,6 +1,6 @@
 """Stage 3 — Verify.
 
-Nothing the narrator produced is trusted. Three independent layers:
+Nothing the narrator produced is trusted. Four independent layers:
 
   L1  prose    — every figure on screen must parse back to the number it was
                  rendered from, be cited, and carry a source
@@ -8,6 +8,9 @@ Nothing the narrator produced is trusted. Three independent layers:
                  agree with the direction and favour-ability being asserted
   L3  source   — every figure, cited or not, is re-derived from the journal
                  lines, the plan of record and the FX table
+  L4  document — the sections are reconciled with each other: driver totals,
+                 primary-cause language and completeness claims must match
+                 the arithmetic
 
 A blocking finding stops sign-off. Warnings are disclosed exceptions that the
 signer must individually attest to. The module also mutation-tests itself on
@@ -18,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from collections import defaultdict
 from decimal import Decimal
 
 from app import config
@@ -94,6 +98,19 @@ SUBJECT_METRICS = [
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _CLAUSE_SPLIT = re.compile(r"[,;]")
 _SUBJECT_SPLIT = re.compile(r"\b(came in at|closed at|came in|closed|was|were|is|are)\b", re.IGNORECASE)
+
+# Cross-section consistency. The sections are read as one document: a driver
+# claim made in one section must reconcile with the group attribution, and the
+# prose must not claim more completeness or priority than the arithmetic shows.
+PRIMARY_DRIVER_PHRASES = ("primary driver", "largest driver", "main driver", "principal driver")
+COMPLETENESS_PHRASES = (
+    "fully explained",
+    "wholly explained",
+    "entirely explained",
+    "sums exactly",
+    "no unexplained residual",
+)
+ENTIRE_MOVEMENT_PHRASES = ("entire movement", "all of the movement", "wholly attributable")
 
 
 def _direction_matches(sentence: str) -> list[tuple[int, str, str]]:
@@ -801,6 +818,269 @@ def _check_closure(recon: dict, ledger: Ledger, dataset: dict, findings: Finding
 
 
 # ---------------------------------------------------------------------------
+# Cross-section consistency — one document, not twelve independent memos
+# ---------------------------------------------------------------------------
+def _section_text(section: dict) -> str:
+    parts: list[str] = []
+    for paragraph in section.get("paragraphs", []):
+        for token in paragraph["tokens"]:
+            parts.append(token["v"] if token["t"] == "text" else token.get("text", ""))
+        parts.append("\n")
+    return "".join(parts)
+
+
+def _claimed_primary_driver(variance: dict, text: str) -> dict | None:
+    """The driver the prose calls primary, matched by its cause phrase."""
+    lowered = text.lower()
+    positions = [lowered.find(phrase) for phrase in PRIMARY_DRIVER_PHRASES if phrase in lowered]
+    if not positions:
+        return None
+    phrase_position = min(positions)
+    best: tuple[int, dict] | None = None
+    for driver in variance["drivers"]:
+        cause = driver["cause"].lower()
+        start = lowered.find(cause)
+        if start < 0:
+            continue
+        end = start + len(cause)
+        if end > phrase_position:
+            continue
+        distance = phrase_position - end
+        if best is None or distance < best[0]:
+            best = (distance, driver)
+    return best[1] if best is not None else None
+
+
+def _section_driver_sum(section: dict, facts: dict[str, dict]) -> Decimal:
+    total = Decimal(0)
+    seen: set[str] = set()
+    for fact_id in section.get("driver_fact_ids", []):
+        if fact_id in seen:
+            continue
+        seen.add(fact_id)
+        fact = facts.get(fact_id)
+        if fact is not None and fact.get("kind") == "driver":
+            total += D(fact["value"])
+    return q2(total)
+
+
+def _check_cross_section(
+    sections: list[dict],
+    facts: dict[str, dict],
+    recon: dict,
+    findings: Findings,
+) -> dict:
+    """Reconcile what the sections say collectively, then test their claims.
+
+    Two defects this catches that per-section checks cannot:
+      * the same attributed amount told in more than one section, and
+      * prose that claims full coverage or a primary cause the arithmetic denies.
+    """
+    by_var = {v["variance_id"]: v for v in recon["variances"]}
+    variance_sections = [s for s in sections if s.get("variance_id") in by_var]
+
+    # The population the commentary is required to explain is the variances it
+    # actually covers. Each driver's total over that population is the number
+    # the sections must add up to between them.
+    expected: dict[str, Decimal] = defaultdict(Decimal)
+    for section in variance_sections:
+        variance = by_var[section["variance_id"]]
+        for driver in variance["drivers"]:
+            expected[driver["driver"]] += D(driver["amount"])
+
+    cited: dict[str, Decimal] = defaultdict(Decimal)
+    citations: dict[str, list[str]] = defaultdict(list)
+    for section in variance_sections:
+        for fact_id in section.get("driver_fact_ids", []):
+            fact = facts.get(fact_id)
+            if fact is None or fact.get("kind") != "driver":
+                continue
+            driver_id = fact["derivation"].get("driver")
+            cited[driver_id] += D(fact["value"])
+            citations[fact_id].append(section["section_id"])
+
+    for fact_id, section_ids in sorted(citations.items()):
+        if len(section_ids) < 2:
+            continue
+        findings.add(
+            BLOCK,
+            "DRIVER_DOUBLE_COUNT",
+            f"Driver figure {fact_id} is cited by {len(section_ids)} sections "
+            f"({', '.join(section_ids)}); the same attributed amount is told more than once.",
+            fact_id=fact_id,
+            detail={"section_ids": section_ids},
+        )
+
+    driver_rows: list[dict] = []
+    for driver_id in sorted(set(expected) | set(cited)):
+        group_total = q2(expected.get(driver_id, D(0)))
+        narrative_total = q2(cited.get(driver_id, D(0)))
+        difference = q2(narrative_total - group_total)
+        status = "pass" if difference == 0 else "fail"
+        driver_rows.append({
+            "driver": driver_id,
+            "label": config.DRIVERS.get(driver_id, driver_id),
+            "expected_usd": str(group_total),
+            "cited_usd": str(narrative_total),
+            "difference_usd": str(difference),
+            "status": status,
+        })
+        if status == "fail":
+            findings.add(
+                BLOCK,
+                "DRIVER_TOTAL_MISMATCH",
+                f"Across the commented sections the {config.DRIVERS.get(driver_id, driver_id)} driver totals "
+                f"{narrative_total} USD against {group_total} USD in the reconciled attribution "
+                f"({difference} USD difference).",
+                detail={
+                    "driver": driver_id,
+                    "expected_usd": str(group_total),
+                    "cited_usd": str(narrative_total),
+                    "difference_usd": str(difference),
+                },
+            )
+
+    claim_rows: list[dict] = []
+    for section in variance_sections:
+        variance = by_var[section["variance_id"]]
+        text = _section_text(section)
+        lowered = text.lower()
+        variance_usd = D(variance["variance_usd"])
+
+        if any(phrase in lowered for phrase in PRIMARY_DRIVER_PHRASES):
+            claimed = _claimed_primary_driver(variance, text)
+            nonzero = [d for d in variance["drivers"] if D(d["amount"]) != 0]
+            if claimed is not None and nonzero:
+                largest = max(nonzero, key=lambda d: abs(D(d["amount"])))
+                ok = claimed["fact_id"] == largest["fact_id"] or abs(D(claimed["amount"])) == abs(D(largest["amount"]))
+                claim_rows.append({
+                    "section_id": section["section_id"],
+                    "claim": "primary driver",
+                    "expected": f"{largest['driver']} ({largest['amount']})",
+                    "actual": f"{claimed['driver']} ({claimed['amount']})",
+                    "status": "pass" if ok else "fail",
+                })
+                if not ok:
+                    findings.add(
+                        BLOCK,
+                        "PRIMARY_DRIVER_CONFLICT",
+                        f"{section['section_id']} calls {claimed['driver']} "
+                        f"({claimed['amount']} USD) the primary driver, but {largest['driver']} "
+                        f"({largest['amount']} USD) is the larger attribution.",
+                        section_id=section["section_id"],
+                        variance_id=section["variance_id"],
+                        detail={
+                            "claimed_driver": claimed["driver"],
+                            "claimed_usd": claimed["amount"],
+                            "largest_driver": largest["driver"],
+                            "largest_usd": largest["amount"],
+                        },
+                    )
+
+        if any(phrase in lowered for phrase in COMPLETENESS_PHRASES):
+            attributed = _section_driver_sum(section, facts)
+            difference = q2(attributed - variance_usd)
+            ok = difference == 0
+            claim_rows.append({
+                "section_id": section["section_id"],
+                "claim": "attribution complete",
+                "expected": str(variance_usd),
+                "actual": str(attributed),
+                "status": "pass" if ok else "fail",
+            })
+            if not ok:
+                findings.add(
+                    BLOCK,
+                    "COVERAGE_OVERSTATED",
+                    f"{section['section_id']} says the attribution is complete, but its drivers total "
+                    f"{attributed} USD against a variance of {variance_usd} USD ({difference} USD unaccounted).",
+                    section_id=section["section_id"],
+                    variance_id=section["variance_id"],
+                    detail={"expected_usd": str(variance_usd), "actual_usd": str(attributed),
+                            "difference_usd": str(difference)},
+                )
+
+        for sentence in _SENTENCE_SPLIT.split(text):
+            if not any(phrase in sentence.lower() for phrase in ENTIRE_MOVEMENT_PHRASES):
+                continue
+            key = (
+                "nondiscretionary"
+                if ("fx" in sentence.lower() or "one-off" in sentence.lower())
+                else "discretionary"
+            )
+            category_id = variance.get("category_fact_ids", {}).get(key)
+            if category_id is None:
+                continue
+            category_value = D(facts[category_id]["value"])
+            difference = q2(category_value - variance_usd)
+            ok = difference == 0
+            claim_rows.append({
+                "section_id": section["section_id"],
+                "claim": f"entire movement in {key} drivers",
+                "expected": str(variance_usd),
+                "actual": str(category_value),
+                "status": "pass" if ok else "fail",
+            })
+            if not ok:
+                findings.add(
+                    BLOCK,
+                    "COVERAGE_OVERSTATED",
+                    f"{section['section_id']} says the entire movement sits in {key} drivers, but those "
+                    f"drivers total {category_value} USD against a variance of {variance_usd} USD.",
+                    section_id=section["section_id"],
+                    variance_id=section["variance_id"],
+                    detail={"bucket": key, "expected_usd": str(variance_usd), "actual_usd": str(category_value)},
+                )
+
+    # The summary may only claim the group gap is fully explained by the
+    # sections below if their P&L effects actually add up to it.
+    summary = next((s for s in sections if s["kind"] == "summary"), None)
+    if summary is not None:
+        lowered = _section_text(summary).lower()
+        if any(phrase in lowered for phrase in ("fully explained", "wholly explained", "entirely explained")):
+            narrated = q2(sum(
+                (-ACCOUNTS[by_var[s["variance_id"]]["account"]].presentation_sign)
+                * D(by_var[s["variance_id"]]["variance_usd"])
+                for s in variance_sections
+                if by_var[s["variance_id"]]["statement"] == "PL"
+            ))
+            group = next(
+                (D(a["value_usd"]["variance"]) for a in recon["aggregates"] if a["aggregate_id"] == "operating_income"),
+                D(0),
+            )
+            difference = q2(narrated - group)
+            ok = difference == 0
+            claim_rows.append({
+                "section_id": summary["section_id"],
+                "claim": "group gap fully explained",
+                "expected": str(group),
+                "actual": str(narrated),
+                "status": "pass" if ok else "fail",
+            })
+            if not ok:
+                findings.add(
+                    BLOCK,
+                    "COVERAGE_OVERSTATED",
+                    f"{summary['section_id']} says the group gap to plan is fully explained by the sections below, "
+                    f"but their operating-income effect totals {narrated} USD against a group variance of "
+                    f"{group} USD ({difference} USD unaccounted).",
+                    section_id=summary["section_id"],
+                    detail={"expected_usd": str(group), "actual_usd": str(narrated),
+                            "difference_usd": str(difference)},
+                )
+
+    passed = len([r for r in driver_rows if r["status"] == "pass"]) + len(
+        [c for c in claim_rows if c["status"] == "pass"]
+    )
+    return {
+        "driver_totals": driver_rows,
+        "claims": claim_rows,
+        "passed": passed,
+        "total": len(driver_rows) + len(claim_rows),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Self-test — prove the gate catches the defects it claims to catch
 # ---------------------------------------------------------------------------
 MUTATIONS = [
@@ -815,6 +1095,9 @@ MUTATIONS = [
     ("two_figure_sign_and_scale", "Two figures in one paragraph changed: one sign-flipped, one rescaled"),
     ("wrong_comparator_and_scope", "One figure on the wrong basis and another from the wrong entity, together"),
     ("prose_comparator_swap", "The prose names a revised plan while the section is scoped to budget"),
+    ("driver_double_count", "The same attributed driver figure told in two sections"),
+    ("primary_driver_overstated", "A smaller driver named as the primary cause"),
+    ("summary_coverage_overstatement", "The summary claims the sections fully explain the group gap"),
 ]
 
 
@@ -890,6 +1173,47 @@ def _mutate(sections: list[dict], mutation: str, facts: dict[str, dict], recon: 
             "t": "text", "v": " A further forty thousand dollars of accrued spend is expected to unwind.",
         })
         return {"sections": mutated, "hint": "UNSOURCED_FIGURE"}
+
+    if mutation == "driver_double_count":
+        # A second section repeats a driver figure already told in the first,
+        # so the group attribution is inflated even though each section looks
+        # internally plausible.
+        with_drivers = [s for s in mutated if s["kind"] == "variance" and s.get("driver_fact_ids")]
+        if len(with_drivers) < 2:
+            return None
+        donor, receiver = with_drivers[0], with_drivers[1]
+        receiver["driver_fact_ids"].append(donor["driver_fact_ids"][0])
+        return {"sections": mutated, "hint": "DRIVER_DOUBLE_COUNT+DRIVER_TOTAL_MISMATCH"}
+
+    if mutation == "primary_driver_overstated":
+        # Name the second-largest driver as the primary cause while the figure
+        # that follows is still the largest one.
+        by_var = {v["variance_id"]: v for v in recon["variances"]}
+        for section in mutated:
+            if section["kind"] != "variance":
+                continue
+            variance = by_var.get(section["variance_id"])
+            if variance is None:
+                continue
+            nonzero = [d for d in variance["drivers"] if D(d["amount"]) != 0]
+            if len(nonzero) < 2 or abs(D(nonzero[0]["amount"])) == abs(D(nonzero[1]["amount"])):
+                continue
+            primary, other = nonzero[0], nonzero[1]
+            for paragraph in section["paragraphs"]:
+                for token in paragraph["tokens"]:
+                    if token["t"] == "text" and primary["cause"] in token["v"]:
+                        token["v"] = token["v"].replace(primary["cause"], other["cause"], 1)
+                        return {"sections": mutated, "hint": "PRIMARY_DRIVER_CONFLICT"}
+        return None
+
+    if mutation == "summary_coverage_overstatement":
+        if summary is None:
+            return None
+        summary["paragraphs"][-1]["tokens"].append({
+            "t": "text",
+            "v": " The gap to plan at group level is fully explained by the entity variances set out below.",
+        })
+        return {"sections": mutated, "hint": "COVERAGE_OVERSTATED"}
 
     figures = _figures(target_section)
     if not figures:
@@ -1008,6 +1332,7 @@ def self_test(sections: list[dict], facts: dict[str, dict], recon: dict) -> dict
             continue
         local = Findings()
         local_stats = _check_sections(mutated["sections"], facts, recon, local, check_coverage=False)
+        _check_cross_section(mutated["sections"], facts, recon, local)
         categories = sorted(local.categories())
         failed_figures = len([c for c in local_stats["claims"] if c["status"] == "fail"])
         results.append({
@@ -1059,6 +1384,7 @@ def verify(dataset: dict, recon: dict, commentary: dict) -> dict:
             )
 
     stats = _check_sections(commentary["sections"], facts, recon, findings)
+    cross_section = _check_cross_section(commentary["sections"], facts, recon, findings)
     closure = _check_closure(recon, ledger, dataset, findings)
     test = self_test(commentary["sections"], facts, recon)
 
@@ -1102,6 +1428,8 @@ def verify(dataset: dict, recon: dict, commentary: dict) -> dict:
         "closure_passed": len([c for c in closure if c["status"] == "pass"]),
         "coverage_total": len(coverage_rows),
         "coverage_covered": covered,
+        "cross_section_passed": cross_section["passed"],
+        "cross_section_total": cross_section["total"],
         "sections": stats["sections"],
         "words": stats["words"],
     }
@@ -1123,6 +1451,7 @@ def verify(dataset: dict, recon: dict, commentary: dict) -> dict:
         "fact_checks": fact_checks,
         "closure": closure,
         "coverage": coverage_rows,
+        "cross_section": cross_section,
         "self_test": test,
         "stats": passing,
         "gate": {

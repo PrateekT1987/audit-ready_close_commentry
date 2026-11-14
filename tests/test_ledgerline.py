@@ -118,8 +118,6 @@ def test_quantity_scanner_catches_spelled_and_vague_quantities() -> None:
 
 
 def test_spelled_out_quantity_blocks_the_section() -> None:
-    import copy
-
     sections = copy.deepcopy(STRICT["sections"])
     sections[0]["paragraphs"][0]["tokens"].append({
         "t": "text",
@@ -289,7 +287,7 @@ def test_clean_run_passes_every_layer() -> None:
 
 def test_verifier_self_test_detects_every_mutation() -> None:
     self_test = VERIFIED["self_test"]
-    assert self_test["total"] == 11 and self_test["detected"] == 11
+    assert self_test["total"] == 14 and self_test["detected"] == 14
     assert self_test["passed"] is True
     names = {m["mutation"] for m in self_test["mutations"]}
     assert names == {
@@ -297,8 +295,26 @@ def test_verifier_self_test_detects_every_mutation() -> None:
         "spelled_out_amount", "wrong_scope", "basis_swap",
         "summary_section_scale", "two_figure_sign_and_scale",
         "wrong_comparator_and_scope", "prose_comparator_swap",
+        "driver_double_count", "primary_driver_overstated",
+        "summary_coverage_overstatement",
     }
     assert all(m["detected"] and m["categories"] for m in self_test["mutations"])
+
+
+def test_self_test_covers_cross_section_mutations() -> None:
+    by_name = {m["mutation"]: m for m in VERIFIED["self_test"]["mutations"]}
+
+    duplicate = by_name["driver_double_count"]
+    assert duplicate["detected"] is True
+    assert {"DRIVER_DOUBLE_COUNT", "DRIVER_TOTAL_MISMATCH"} <= set(duplicate["categories"])
+
+    primary = by_name["primary_driver_overstated"]
+    assert primary["detected"] is True
+    assert primary["categories"] == ["PRIMARY_DRIVER_CONFLICT"]
+
+    coverage = by_name["summary_coverage_overstatement"]
+    assert coverage["detected"] is True
+    assert coverage["categories"] == ["COVERAGE_OVERSTATED"]
 
 
 def test_self_test_covers_spelled_out_quantities() -> None:
@@ -421,6 +437,72 @@ def test_direction_semantics_handle_zero_and_inline() -> None:
         "Cash came in at $150.0K, in line with plan.", nonzero
     )
     assert _claim_categories("Cash came in at $150.0K, above plan.", nonzero) == set()
+
+
+def test_cross_section_driver_totals_reconcile() -> None:
+    cross = VERIFIED["cross_section"]
+    assert cross["total"] == cross["passed"] > 0
+    assert len(cross["driver_totals"]) == len({r["driver"] for r in cross["driver_totals"]}) == 10
+    for row in cross["driver_totals"]:
+        assert row["status"] == "pass"
+        assert row["expected_usd"] == row["cited_usd"]
+        assert row["difference_usd"] == "0.00"
+    # Every live prose claim (primary cause, complete attribution, entire
+    # movement) ties to the arithmetic behind it.
+    assert all(claim["status"] == "pass" for claim in cross["claims"])
+    assert {claim["claim"] for claim in cross["claims"]} >= {"primary driver", "attribution complete"}
+
+
+def _cross_categories(sections: list[dict]) -> tuple[set[str], dict]:
+    findings = verify_engine.Findings()
+    facts = {f["fact_id"]: f for f in RECON["facts"]}
+    result = verify_engine._check_cross_section(sections, facts, RECON, findings)
+    return findings.categories(), result
+
+
+def test_driver_told_in_two_sections_blocks() -> None:
+    sections = copy.deepcopy(STRICT["sections"])
+    with_drivers = [s for s in sections if s["kind"] == "variance" and s.get("driver_fact_ids")]
+    with_drivers[1]["driver_fact_ids"].append(with_drivers[0]["driver_fact_ids"][0])
+    categories, result = _cross_categories(sections)
+    assert {"DRIVER_DOUBLE_COUNT", "DRIVER_TOTAL_MISMATCH"} <= categories
+    assert any(row["status"] == "fail" for row in result["driver_totals"])
+    assert any(row["difference_usd"] != "0.00" for row in result["driver_totals"])
+
+
+def test_primary_driver_must_be_the_largest_attribution() -> None:
+    sections = copy.deepcopy(STRICT["sections"])
+    by_var = {v["variance_id"]: v for v in RECON["variances"]}
+    target = next(s for s in sections if s["kind"] == "variance")
+    variance = by_var[target["variance_id"]]
+    nonzero = [d for d in variance["drivers"] if Decimal(d["amount"]) != 0]
+    assert len(nonzero) >= 2
+    primary, other = nonzero[0], nonzero[1]
+    replaced = False
+    for paragraph in target["paragraphs"]:
+        for token in paragraph["tokens"]:
+            if token["t"] == "text" and primary["cause"] in token["v"]:
+                token["v"] = token["v"].replace(primary["cause"], other["cause"], 1)
+                replaced = True
+    assert replaced
+    categories, result = _cross_categories(sections)
+    assert categories == {"PRIMARY_DRIVER_CONFLICT"}
+    assert any(claim["claim"] == "primary driver" and claim["status"] == "fail"
+               for claim in result["claims"])
+
+
+def test_summary_cannot_claim_coverage_the_sections_do_not_have() -> None:
+    sections = copy.deepcopy(STRICT["sections"])
+    summary = next(s for s in sections if s["kind"] == "summary")
+    summary["paragraphs"][-1]["tokens"].append({
+        "t": "text",
+        "v": " The gap to plan at group level is fully explained by the entity variances set out below.",
+    })
+    categories, result = _cross_categories(sections)
+    assert categories == {"COVERAGE_OVERSTATED"}
+    claim = next(c for c in result["claims"] if c["claim"] == "group gap fully explained")
+    assert claim["status"] == "fail"
+    assert Decimal(claim["actual"]) != Decimal(claim["expected"])
 
 
 def test_drift_is_blocked() -> None:

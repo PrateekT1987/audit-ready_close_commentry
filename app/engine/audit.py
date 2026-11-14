@@ -86,14 +86,19 @@ def hashes(recon: dict, commentary: dict, verification: dict) -> dict:
         "variances": _variance_core(recon),
         "sections": commentary["sections"],
     })
-    verification_hash = digest({
+    verification_payload = {
         "status": verification["status"],
         "findings": verification["findings"],
         "stats": verification["stats"],
         "coverage": verification["coverage"],
         "closure": verification["closure"],
         "self_test": verification["self_test"],
-    })
+    }
+    # Cross-section reconciliation is committed when the run has it. Runs signed
+    # before this check existed carry no such key, and their hashes still verify.
+    if verification.get("cross_section") is not None:
+        verification_payload["cross_section"] = verification["cross_section"]
+    verification_hash = digest(verification_payload)
     # The fact-store hash commits to each fact's *full* provenance, not just its
     # value: derivation lines (journal ids and amounts), FX rate, opening period,
     # driver legs, aggregate account lists, presentation sign and source ref.
@@ -145,6 +150,20 @@ def preflight(recon: dict, verification: dict, attestations: list[dict]) -> dict
             "label": "Variance attribution reconciles with no unexplained residual",
             "passed": verification["stats"]["closure_passed"] == verification["stats"]["closure_checks"],
             "detail": f"{verification['stats']['closure_passed']} of {verification['stats']['closure_checks']} close",
+        },
+        {
+            "id": "cross_section",
+            "label": "Cross-section driver arithmetic reconciles",
+            "passed": (
+                verification.get("cross_section") is None
+                or verification["cross_section"]["passed"] == verification["cross_section"]["total"]
+            ),
+            "detail": (
+                "not recorded for this run"
+                if verification.get("cross_section") is None
+                else f"{verification['cross_section']['passed']} of "
+                     f"{verification['cross_section']['total']} driver and claim checks tie"
+            ),
         },
         {
             "id": "self_test",
@@ -318,6 +337,7 @@ def evidence_pack(run: dict, recon: dict, commentary: dict, verification: dict, 
             "fact_checks": verification["fact_checks"],
             "coverage": verification["coverage"],
             "closure": verification["closure"],
+            "cross_section": verification.get("cross_section"),
             "self_test": verification["self_test"],
         },
         "controls": {

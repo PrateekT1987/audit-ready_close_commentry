@@ -63,8 +63,8 @@ This exists to prove the gate blocks; it is not a feature of normal operation.
 
 ### 3. Verify
 
-`app/engine/verify.py` trusts nothing the narrator produced. It runs four
-independent layers:
+`app/engine/verify.py` trusts nothing the narrator produced. It runs five
+independent passes:
 
 * **Prose → fact (L1):** parse each rendered figure back off the page, check it
   cites a fact, and check the displayed value rounds from that fact at the
@@ -84,19 +84,30 @@ independent layers:
 * **Fact → source (L3):** re-derive all 862 facts from the raw journal lines,
   plan rows and FX table, including presentation sign and Balance Sheet
   roll-forward. A stored fact is never taken at face value.
+* **Section → document (L4):** the sections are reconciled with each other.
+  For every driver id, the figures cited across sections must equal the
+  driver's total in the reconciled attribution behind the narrated variances,
+  and no driver figure may be told twice. Prose that calls a driver the
+  primary cause, says the attribution is complete, or says the entire movement
+  sits in one bucket is checked against that arithmetic. The summary may only
+  claim the group gap is fully explained if the sections' operating-income
+  effect adds up to it.
 * **Narrative quality:** materiality coverage (12/12), driver disclosure,
   attribution closure (12/12), and unsourced-figure detection.
 
-On every verification run the verifier also attacks itself with eleven mutations:
+On every verification run the verifier also attacks itself with fourteen mutations:
 `scale_error`, `sign_flip`, `rounding_drift`, `unsourced_figure`,
 `spelled_out_amount`, `wrong_scope`, `basis_swap`, `summary_section_scale`,
 `two_figure_sign_and_scale`, `wrong_comparator_and_scope`,
-`prose_comparator_swap`. They cover the summary section and compound edits — a
-sign flip plus a scale error in one paragraph, a wrong comparator plus a wrong
-entity in one section, prose that names a revised plan while the section is
-scoped to budget, and a quantity written in words so a digit-only scan would
-miss it. The run reports how many it caught and how many figures each mutation
-broke (currently 11/11), so the gate is demonstrated rather than asserted.
+`prose_comparator_swap`, `driver_double_count`, `primary_driver_overstated`,
+`summary_coverage_overstatement`. They cover the summary section and compound
+edits — a sign flip plus a scale error in one paragraph, a wrong comparator
+plus a wrong entity in one section, prose that names a revised plan while the
+section is scoped to budget, a quantity written in words so a digit-only scan
+would miss it, a driver figure told in two sections, a smaller cause named as
+primary, and a summary that claims more coverage than the sections deliver. The
+run reports how many it caught and how many figures each mutation broke
+(currently 14/14), so the gate is demonstrated rather than asserted.
 
 ### 4. Sign off
 
@@ -158,14 +169,14 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-32 tests cover the money round-trip, the quantity vocabulary, reconcile
-invariants, the blocking trial-balance proof, sequence-ordered chain
-verification, period-correct narration, separation of duties, semantic
-direction and comparator parsing, fact-bound narration, the clean and
-adversarial verification outcomes, the eleven-mutation self-test (including
-summary, compound and spelled-out-quantity edits), sign-off refusal, chain
-tamper detection, evidence-pack manifests and the HTTP surface. No pytest
-dependency.
+37 tests cover the money round-trip, the quantity vocabulary, cross-section
+driver and prose-claim reconciliation, reconcile invariants, the blocking
+trial-balance proof, sequence-ordered chain verification, period-correct
+narration, separation of duties, semantic direction and comparator parsing,
+fact-bound narration, the clean and adversarial verification outcomes, the
+fourteen-mutation self-test (including summary, compound,
+spelled-out-quantity and cross-section edits), sign-off refusal, chain tamper
+detection, evidence-pack manifests and the HTTP surface. No pytest dependency.
 
 ## Tour
 
@@ -220,7 +231,7 @@ app/
   engine/
     reconcile.py       trial balance, variances, drivers, controls, facts
     narrate.py         fact-constrained claim plan (+ deliberate drift mode)
-    verify.py          four verification layers + eleven-mutation self-test
+    verify.py          five verification layers + fourteen-mutation self-test
     audit.py           hashes, preflight, signature, chain, exports
   static/
     index.html         single page
