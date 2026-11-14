@@ -72,6 +72,7 @@ def _run_view(run: dict) -> dict:
     verification = payload["verification"]
     signoffs = store.load_signoffs(run["id"])
     signoff = signoffs[-1] if signoffs else None
+    governance = store.run_governance(run["id"])
     state = audit.preflight(recon, verification, [])
     _, chain = _chain_state()
 
@@ -86,6 +87,8 @@ def _run_view(run: dict) -> dict:
             "mode": run["mode"],
             "mode_label": MODE_LABELS.get(run["mode"], run["mode"]),
             "label": run["label"],
+            "preparer": governance["preparer"],
+            "dual_control": governance["dual_control"],
         },
         "recon": {
             **{k: v for k, v in recon.items() if k != "facts"},
@@ -118,6 +121,8 @@ def _dataset_for_period(period: str) -> dict:
 class CreateRun(BaseModel):
     period: str | None = None
     mode: str = Field(default="strict", pattern="^(strict|drift)$")
+    prepared_by: str = Field(default="close-engine", min_length=1)
+    dual_control: bool = False
 
 
 class RenarrateRequest(BaseModel):
@@ -175,6 +180,9 @@ def list_runs() -> dict:
 def create_run(body: CreateRun) -> dict:
     raw = dataset()
     period = body.period or raw["meta"]["current_period"]
+    preparer = body.prepared_by.strip()
+    if not preparer:
+        raise HTTPException(422, "prepared_by must name the preparer of record")
     run_id = store.new_run_id()
     payload = _execute(period, body.mode)
     status = _status(payload["verification"], signed=False)
@@ -186,11 +194,13 @@ def create_run(body: CreateRun) -> dict:
         mode=body.mode,
         label=f"{config.PERIOD_LABELS.get(period, period)} close",
     )
-    store.log_event(run_id, "close-engine", "run.created", {
+    store.log_event(run_id, preparer, "run.created", {
         "period": period,
         "mode": body.mode,
         "material_variances": payload["recon"]["stats"]["material_variances"],
         "status": status,
+        "prepared_by": preparer,
+        "dual_control": body.dual_control,
     })
     store.log_event(run_id, "close-engine", "reconcile.completed", payload["recon"]["stats"])
     store.log_event(run_id, "close-engine", "narrate.completed", {
@@ -284,6 +294,7 @@ def sign_off(run_id: str, body: SignOffRequest) -> dict:
     if run["status"] == "signed":
         raise HTTPException(409, "this run has already been signed off")
     payload = run["payload"]
+    governance = store.run_governance(run_id)
     existing = store.load_signoffs()
     prev_hash = existing[-1]["chain_hash"] if existing else "genesis"
     try:
@@ -298,6 +309,8 @@ def sign_off(run_id: str, body: SignOffRequest) -> dict:
             attestations=[a.model_dump() for a in body.attestations],
             prev_chain_hash=prev_hash,
             sequence=store.next_sequence(),
+            preparer=governance["preparer"],
+            dual_control=governance["dual_control"],
         )
     except audit.SignOffRefused as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -315,6 +328,8 @@ def sign_off(run_id: str, body: SignOffRequest) -> dict:
         "signoff_id": record["signoff_id"],
         "chain_hash": record["chain_hash"],
         "attested": len(record["attestations"]),
+        "preparer": record["preparer"],
+        "dual_control": record["dual_control"],
     })
     return _run_view(store.load_run(run_id))
 

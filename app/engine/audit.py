@@ -64,8 +64,9 @@ def _chain_payload(record: dict) -> dict:
         "signer": record["signer"],
         "signed_at": record["signed_at"],
     }
-    if "sequence" in record:
-        payload["sequence"] = record["sequence"]
+    for key in ("sequence", "preparer", "dual_control"):
+        if key in record:
+            payload[key] = record[key]
     return payload
 
 
@@ -181,9 +182,20 @@ def sign(
     attestations: list[dict],
     prev_chain_hash: str,
     sequence: int,
+    preparer: str = "",
+    dual_control: bool = False,
 ) -> dict:
-    if not signer or not signer.strip():
+    signer_name = signer.strip() if signer else ""
+    preparer_name = preparer.strip() if preparer else ""
+    if not signer_name:
         raise SignOffRefused("A named signer is required.")
+    if not preparer_name:
+        raise SignOffRefused("A preparer of record is required for separation of duties.")
+    if signer_name.casefold() == preparer_name.casefold() and not dual_control:
+        raise SignOffRefused(
+            "Separation of duties: the signer must be different from the preparer "
+            f"({preparer_name}). Enable dual control on the run to waive this requirement."
+        )
     state = preflight(recon, verification, attestations)
     if not state["permitted"]:
         failed = [c["label"] for c in state["checks"] if not c["passed"]]
@@ -196,7 +208,9 @@ def sign(
         "sequence": sequence,
         "run_id": run["id"],
         "period": recon["period"],
-        "signer": signer.strip(),
+        "signer": signer_name,
+        "preparer": preparer_name,
+        "dual_control": bool(dual_control),
         "role": role.strip() or "Controller",
         "signed_at": signed_at,
         "note": note.strip(),

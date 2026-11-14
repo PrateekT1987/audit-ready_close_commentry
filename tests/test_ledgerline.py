@@ -268,18 +268,22 @@ def _attestations(verification: dict) -> list[dict]:
 
 
 def _sign(run_id: str = "run_test", prev: str = "genesis", sequence: int = 1,
-          verification: dict | None = None, commentary: dict | None = None) -> dict:
+          verification: dict | None = None, commentary: dict | None = None,
+          signer: str = "A. Mensah", preparer: str = "J. Okafor",
+          dual_control: bool = False) -> dict:
     return audit.sign(
         {"id": run_id},
         RECON,
         commentary or STRICT,
         verification or VERIFIED,
-        signer="A. Mensah",
+        signer=signer,
         role="Group Controller",
         note="October close reviewed.",
         attestations=_attestations(verification or VERIFIED),
         prev_chain_hash=prev,
         sequence=sequence,
+        preparer=preparer,
+        dual_control=dual_control,
     )
 
 
@@ -289,6 +293,7 @@ def test_signoff_requires_attestation() -> None:
             {"id": "run_test"}, RECON, STRICT, VERIFIED,
             signer="A. Mensah", role="Group Controller", note="",
             attestations=[], prev_chain_hash="genesis", sequence=1,
+            preparer="J. Okafor",
         )
     except audit.SignOffRefused as exc:
         assert "attested" in str(exc)
@@ -302,10 +307,41 @@ def test_signoff_requires_named_signer() -> None:
             {"id": "run_test"}, RECON, STRICT, VERIFIED,
             signer="   ", role="Group Controller", note="",
             attestations=_attestations(VERIFIED), prev_chain_hash="genesis", sequence=1,
+            preparer="J. Okafor",
         )
     except audit.SignOffRefused:
         return
     raise AssertionError("sign-off without a signer was accepted")
+
+
+def test_separation_of_duties_requires_a_different_signer() -> None:
+    # The preparer cannot sign their own run.
+    try:
+        _sign(signer="J. Okafor", preparer="j. okafor")
+    except audit.SignOffRefused as exc:
+        assert "Separation of duties" in str(exc)
+    else:
+        raise AssertionError("the preparer signed their own run")
+
+    # A missing preparer is refused rather than silently waived.
+    try:
+        _sign(preparer="   ")
+    except audit.SignOffRefused as exc:
+        assert "preparer" in str(exc)
+    else:
+        raise AssertionError("a sign-off with no preparer of record was accepted")
+
+    # Dual control waives the conflict and the waiver is bound into the record.
+    record = _sign(signer="J. Okafor", preparer="J. Okafor", dual_control=True)
+    assert record["signer"] == "J. Okafor"
+    assert record["preparer"] == "J. Okafor"
+    assert record["dual_control"] is True
+    assert record["chain_hash"] == audit.digest(audit._chain_payload(record))
+
+    # A different signer is accepted without the waiver.
+    record = _sign(signer="A. Mensah", preparer="J. Okafor")
+    assert record["preparer"] == "J. Okafor"
+    assert record["dual_control"] is False
 
 
 def test_chain_links_and_detects_tamper() -> None:
@@ -373,6 +409,9 @@ def test_legacy_signoff_without_sequence_still_verifies() -> None:
     record = _sign("run_a", "genesis", 1)
     legacy = copy.deepcopy(record)
     legacy.pop("sequence")
+    # Records from before separation of duties also predate the preparer fields.
+    legacy.pop("preparer", None)
+    legacy.pop("dual_control", None)
     legacy["chain_hash"] = audit.digest({
         "prev": legacy["prev_chain_hash"],
         "run_id": legacy["run_id"],
@@ -531,6 +570,61 @@ def test_http_pipeline() -> None:
     chain = client.get("/api/audit/chain").json()
     assert chain["intact"] is True
     assert chain["signoffs"][-1]["signoff_id"] == signed_view["signoff"]["signoff_id"]
+
+
+def test_http_separation_of_duties() -> None:
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+
+    created = client.post("/api/runs", json={
+        "mode": "strict", "prepared_by": "P. Raghavan", "dual_control": False,
+    })
+    assert created.status_code == 201, created.text
+    view = created.json()
+    run_id = view["run"]["id"]
+    assert view["run"]["preparer"] == "P. Raghavan"
+    assert view["run"]["dual_control"] is False
+    assert view["verification"]["gate"]["blocking"] == 0
+    warn_ids = [f["finding_id"] for f in view["verification"]["findings"] if f["severity"] == "warn"]
+    attestations = [{"finding_id": fid, "rationale": "Immaterial; cleared after cut-off."} for fid in warn_ids]
+
+    refused = client.post(f"/api/runs/{run_id}/signoff", json={
+        "signer": "p. raghavan", "attestations": attestations,
+    })
+    assert refused.status_code == 409
+    assert "Separation of duties" in refused.json()["error"]
+
+    signed = client.post(f"/api/runs/{run_id}/signoff", json={
+        "signer": "A. Mensah", "attestations": attestations,
+    })
+    assert signed.status_code == 201, signed.text
+    signoff = signed.json()["signoff"]
+    assert signoff["signer"] == "A. Mensah"
+    assert signoff["preparer"] == "P. Raghavan"
+    assert signoff["dual_control"] is False
+    assert signed.json()["chain"][-1]["status"] == "intact"
+
+    # A dual-control run lets the preparer sign, and records the waiver.
+    dual = client.post("/api/runs", json={
+        "mode": "strict", "prepared_by": "P. Raghavan", "dual_control": True,
+    }).json()
+    dual_id = dual["run"]["id"]
+    dual_attest = [
+        {"finding_id": f["finding_id"], "rationale": "Immaterial; cleared after cut-off."}
+        for f in dual["verification"]["findings"] if f["severity"] == "warn"
+    ]
+    dual_signed = client.post(f"/api/runs/{dual_id}/signoff", json={
+        "signer": "P. Raghavan", "attestations": dual_attest,
+    })
+    assert dual_signed.status_code == 201, dual_signed.text
+    dual_record = dual_signed.json()["signoff"]
+    assert dual_record["signer"] == dual_record["preparer"] == "P. Raghavan"
+    assert dual_record["dual_control"] is True
+
+    # A blank preparer is rejected when the run is opened.
+    assert client.post("/api/runs", json={"mode": "strict", "prepared_by": "  "}).status_code == 422
 
 
 def test_http_adversarial_then_recover() -> None:

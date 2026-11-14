@@ -155,6 +155,24 @@ def load_events(run_id: str) -> list[dict]:
     return [{"at": r["at"], "actor": r["actor"], "action": r["action"], "detail": json.loads(r["detail"])} for r in rows]
 
 
+def run_governance(run_id: str) -> dict:
+    """The preparer and dual-control policy recorded when the run was opened.
+
+    The `run.created` event is the system of record: its actor is the preparer
+    of record, and its detail carries the dual-control flag. Reading governance
+    from the append-only event stream means it cannot be changed by the signer.
+    """
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT actor, detail FROM events WHERE run_id = ? AND action = 'run.created' ORDER BY id LIMIT 1",
+            (run_id,),
+        ).fetchone()
+    if row is None:
+        return {"preparer": "", "dual_control": False}
+    detail = json.loads(row["detail"] or "{}")
+    return {"preparer": row["actor"], "dual_control": bool(detail.get("dual_control", False))}
+
+
 def load_dataset() -> dict:
     if not os.path.exists(DATASET_PATH):
         from app.seed import write_dataset

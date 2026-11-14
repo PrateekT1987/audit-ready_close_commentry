@@ -926,7 +926,11 @@ function renderSignoff() {
         </div>
         <div class="cert-grid">
           <div class="kv"><dt>Signed by</dt><dd style="font-family:var(--sans);font-size:12.5px">${esc(signoff.signer)}</dd></div>
+          <div class="kv"><dt>Prepared by</dt><dd style="font-family:var(--sans);font-size:12.5px">${esc(signoff.preparer || "—")}</dd></div>
           <div class="kv"><dt>Role</dt><dd style="font-family:var(--sans);font-size:12.5px">${esc(signoff.role)}</dd></div>
+          <div class="kv"><dt>Separation of duties</dt><dd style="font-family:var(--sans);font-size:12.5px">${signoff.preparer
+            ? (signoff.dual_control ? "Dual control — preparer also signed" : "Signer ≠ preparer")
+            : "Not recorded on this legacy record"}</dd></div>
           <div class="kv"><dt>Signed at</dt><dd>${esc(new Date(signoff.signed_at).toLocaleString())}</dd></div>
           <div class="kv"><dt>Narrative mode</dt><dd style="font-family:var(--sans)">${esc(signoff.narrative_mode)}</dd></div>
           <div class="kv"><dt>Material variances signed</dt><dd>${signoff.counts.material_variances}</dd></div>
@@ -1046,10 +1050,16 @@ function renderSignoff() {
     <div class="card">
       <div class="card-hd"><h2>Signature</h2><span class="hd-note">recorded against ${esc(run.period)}</span></div>
       <div class="card-bd">
+        <div class="small muted" style="margin-bottom:12px">
+          Prepared by <strong>${esc(run.preparer || "—")}</strong>${run.dual_control
+            ? " · dual control enabled, so the preparer may also sign"
+            : " · the signer must be a different person"}.
+        </div>
         <div class="form-row">
           <label class="field"><span>Signer name</span><input type="text" id="signer-name" placeholder="e.g. A. Mensah" /></label>
           <label class="field"><span>Role</span><input type="text" id="signer-role" value="Group Controller" /></label>
         </div>
+        <div class="small" id="separation-note" hidden style="margin:-2px 0 10px"></div>
         <label class="field"><span>Note (optional, retained in the audit trail)</span><textarea id="signer-note" rows="2" placeholder="e.g. October close reviewed with the CFO; intercompany cut-off differences accepted as immaterial."></textarea></label>
         <div class="row">
           <button class="btn btn-primary" data-act="sign" ${canSign ? "" : "disabled"}>Sign off ${esc(run.period_label)}</button>
@@ -1267,6 +1277,11 @@ async function act(action, target) {
         .filter(([, v]) => v.checked && v.rationale.trim())
         .map(([finding_id, v]) => ({ finding_id, rationale: v.rationale.trim() }));
       if (!signer) { toast("A signer name is required.", "bad"); return; }
+      const preparer = String(S.run.run.preparer || "").trim();
+      if (!S.run.run.dual_control && preparer && signer.toLowerCase() === preparer.toLowerCase()) {
+        toast(`Separation of duties: ${preparer} prepared this run; a different signer is required.`, "bad");
+        return;
+      }
       await withBusy("sign", async () => {
         const view = await api(`/api/runs/${S.run.run.id}/signoff`, {
           method: "POST",
@@ -1312,6 +1327,37 @@ function syncAttestGate() {
   }
   const btn = document.querySelector('[data-act="sign"]');
   if (btn) btn.disabled = Boolean(S.run.verification.gate.blocking) || !complete;
+  syncSignButton();
+}
+
+/* Separation of duties is enforced by the API; this keeps the form honest so
+   the signer is told before they submit rather than after a 409. It also owns
+   the enabled state of the sign button so the attestation and separation rules
+   cannot fight over it. */
+function syncSignButton() {
+  const run = S.run?.run;
+  const input = document.getElementById("signer-name");
+  const note = document.getElementById("separation-note");
+  const btn = document.querySelector('[data-act="sign"]');
+  if (!btn) return;
+  const warns = S.run?.verification?.findings?.filter((f) => f.severity === "warn") || [];
+  const attested = warns.filter((w) => {
+    const a = S.attest[w.finding_id];
+    return Boolean(a && a.checked && a.rationale.trim());
+  }).length;
+  const gateBlocked = Boolean(S.run?.verification?.gate?.blocking) || attested < warns.length;
+  const preparer = String(run?.preparer || "").trim();
+  const signer = input ? input.value.trim() : "";
+  const conflict = Boolean(preparer) && Boolean(signer)
+    && signer.toLowerCase() === preparer.toLowerCase();
+  const blocked = conflict && !run?.dual_control;
+  btn.disabled = gateBlocked || blocked;
+  if (!note) return;
+  note.hidden = !conflict;
+  note.textContent = blocked
+    ? `Separation of duties: ${signer} prepared this run. A different signer is required unless dual control is enabled on the run.`
+    : `Dual control is enabled for this run, so ${signer} may sign as both preparer and signer. The waiver is recorded on the certificate.`;
+  note.style.color = blocked ? "#8a1c1c" : "#6b4a00";
 }
 
 /* --------------------------------------------------------------- events */
@@ -1381,6 +1427,7 @@ document.addEventListener("input", (event) => {
     S.attest[attestId].rationale = event.target.value;
     syncAttestGate();
   }
+  if (event.target.id === "signer-name") syncSignButton();
 });
 
 document.addEventListener("keydown", (event) => {

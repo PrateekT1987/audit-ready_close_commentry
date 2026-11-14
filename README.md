@@ -86,14 +86,26 @@ so the gate is demonstrated rather than asserted.
 ### 4. Sign off
 
 `app/engine/audit.py` refuses a signature unless every gate condition passes
-and every warning has been individually attested with a rationale. The record
-contains:
+and every warning has been individually attested with a rationale.
+
+**Separation of duties.** The run's `run.created` event is the system of
+record for who prepared it: the event actor is the preparer of record and its
+detail carries the run's `dual_control` flag. A signature is refused when the
+signer is the preparer (case-insensitive), unless the run was opened with
+`dual_control: true`. Governance is read from the append-only event stream at
+sign-off time, so a signer cannot change the preparer or waive the rule from the
+sign-off request. The preparer and the dual-control flag are committed into the
+chain hash, so neither can be rewritten after the fact.
+
+The record contains:
 
 * hashes of the content, the verification report and the fact store,
 * inside the fact-store hash, each fact's **full derivation** — journal line
   ids and amounts, FX rate, opening period, driver legs, aggregate accounts and
   source reference — so repointing a fact at different evidence cannot leave
   the certificate intact,
+* the preparer of record and the dual-control flag, so the separation exception
+  (when used) is visible on the certificate,
 * the attestations and the signer's note,
 * a monotonic sequence number (`SO-0001`, `SO-0002`, …) that orders the chain
   independently of the second-resolution wall-clock timestamp,
@@ -131,9 +143,9 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-23 tests cover the money round-trip, reconcile invariants, the blocking
+25 tests cover the money round-trip, reconcile invariants, the blocking
 trial-balance proof, sequence-ordered chain verification, period-correct
-narration, fact-bound
+narration, separation of duties, fact-bound
 narration, the clean and adversarial verification outcomes, the six-mutation
 self-test, sign-off refusal, chain tamper detection, evidence-pack manifests
 and the HTTP surface. No pytest dependency.
@@ -166,7 +178,7 @@ section) from the top bar or the sign-off certificate.
 | `GET` | `/api/health` | Liveness |
 | `GET` | `/api/meta` | Group, entities, accounts, policy, source systems |
 | `GET` | `/api/runs` | Recent runs |
-| `POST` | `/api/runs` | Reconcile, narrate and verify a new run |
+| `POST` | `/api/runs` | Reconcile, narrate and verify a new run (`prepared_by`, `dual_control`) |
 | `GET` | `/api/runs/{id}` | Full workpaper view |
 | `POST` | `/api/runs/{id}/renarrate` | Re-draft (`strict` or `drift`) and re-verify |
 | `POST` | `/api/runs/{id}/verify` | Re-run verification on the current draft |
