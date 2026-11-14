@@ -78,10 +78,14 @@ independent layers:
 * **Narrative quality:** materiality coverage (12/12), driver disclosure,
   attribution closure (12/12), and unsourced-figure detection.
 
-On every verification run the verifier also attacks itself with six mutations:
+On every verification run the verifier also attacks itself with nine mutations:
 `scale_error`, `sign_flip`, `rounding_drift`, `unsourced_figure`,
-`wrong_scope`, `basis_swap`. The run reports how many it caught (currently 6/6),
-so the gate is demonstrated rather than asserted.
+`wrong_scope`, `basis_swap`, `summary_section_scale`,
+`two_figure_sign_and_scale`, `wrong_comparator_and_scope`. The last three attack
+the summary section and compound edits — a sign flip plus a scale error in one
+paragraph, and a wrong comparator plus a wrong entity in one section. The run
+reports how many it caught and how many figures each mutation broke (currently
+9/9), so the gate is demonstrated rather than asserted.
 
 ### 4. Sign off
 
@@ -143,12 +147,12 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-25 tests cover the money round-trip, reconcile invariants, the blocking
+26 tests cover the money round-trip, reconcile invariants, the blocking
 trial-balance proof, sequence-ordered chain verification, period-correct
 narration, separation of duties, fact-bound
-narration, the clean and adversarial verification outcomes, the six-mutation
-self-test, sign-off refusal, chain tamper detection, evidence-pack manifests
-and the HTTP surface. No pytest dependency.
+narration, the clean and adversarial verification outcomes, the nine-mutation
+self-test (including summary and compound edits), sign-off refusal, chain tamper
+detection, evidence-pack manifests and the HTTP surface. No pytest dependency.
 
 ## Tour
 
@@ -203,7 +207,7 @@ app/
   engine/
     reconcile.py       trial balance, variances, drivers, controls, facts
     narrate.py         fact-constrained claim plan (+ deliberate drift mode)
-    verify.py          four verification layers + six-mutation self-test
+    verify.py          four verification layers + nine-mutation self-test
     audit.py           hashes, preflight, signature, chain, exports
   static/
     index.html         single page

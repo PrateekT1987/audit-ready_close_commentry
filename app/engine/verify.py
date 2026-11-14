@@ -612,28 +612,124 @@ MUTATIONS = [
     ("unsourced_figure", "A figure introduced into prose with no citation"),
     ("wrong_scope", "A figure borrowed from a different entity"),
     ("basis_swap", "A budget comparison replaced by the prior-period comparison"),
+    ("summary_section_scale", "The most-read section restated at the wrong scale"),
+    ("two_figure_sign_and_scale", "Two figures in one paragraph changed: one sign-flipped, one rescaled"),
+    ("wrong_comparator_and_scope", "One figure on the wrong basis and another from the wrong entity, together"),
 ]
 
 
+def _figures(section: dict) -> list[tuple[dict, dict]]:
+    return [
+        (paragraph, token)
+        for paragraph in section["paragraphs"]
+        for token in paragraph["tokens"]
+        if token["t"] == "fig"
+    ]
+
+
+def _restate(token: dict, fact: dict, mode: str) -> None:
+    """Rewrite a figure token's display and payload consistently."""
+    value = D(fact["value"])
+    if token.get("sign_mode") == "absolute":
+        value = abs(value)
+    scale = D(token.get("scale", "1"))
+    decimals = token.get("decimals", 0)
+    step = Decimal(1).scaleb(-decimals)
+
+    if mode == "scale":
+        shown = (value * 1000 / scale).quantize(step)
+    elif mode == "sign":
+        shown = -(value / scale).quantize(step)
+    elif mode == "round":
+        shown = (value / scale).quantize(step) + step
+    else:  # pragma: no cover - internal misuse
+        raise ValueError(f"unknown restatement mode {mode!r}")
+
+    token["number"] = str(shown)
+    from app.money import fmt_pct
+
+    token["text"] = (
+        fmt_pct(shown / 100, decimals)["text"]
+        if fact["unit"] == "pct"
+        else _money_from_number(shown, token, scale)
+    )
+
+
 def _mutate(sections: list[dict], mutation: str, facts: dict[str, dict], recon: dict) -> dict | None:
-    """Return {'sections': ..., 'category_hint': ...} for a mutated copy."""
+    """Return {'sections': ..., 'hint': ...} for a mutated copy."""
     mutated = copy.deepcopy(sections)
+    summary = next((s for s in mutated if s["kind"] == "summary"), None)
     target_section = next((s for s in mutated if s["kind"] == "variance"), None)
+
+    if summary is not None and mutation == "summary_section_scale":
+        figures = [
+            (paragraph, token)
+            for paragraph, token in _figures(summary)
+            if token["fact"] in facts and D(facts[token["fact"]]["value"]) != 0
+        ]
+        if not figures:
+            return None
+        _, token = figures[0]
+        fact = facts[token["fact"]]
+        _restate(token, fact, "scale")
+        return {"sections": mutated, "hint": "VALUE_MISMATCH"}
+
     if target_section is None:
         return None
-
-    def first_fig(section):
-        for paragraph in section["paragraphs"]:
-            for token in paragraph["tokens"]:
-                if token["t"] == "fig":
-                    return paragraph, token
-        return None, None
 
     if mutation == "unsourced_figure":
         target_section["paragraphs"][0]["tokens"].append({
             "t": "text", "v": " A further $40K of accrued spend is expected to unwind.",
         })
         return {"sections": mutated, "hint": "UNSOURCED_FIGURE"}
+
+    figures = _figures(target_section)
+    if not figures:
+        return None
+
+    if mutation == "two_figure_sign_and_scale":
+        # Both edits land in the same paragraph, which is where a real model
+        # slip would compound: a sign error and a scale error side by side.
+        paragraph = next(
+            (p for p in target_section["paragraphs"]
+             if len([
+                 t for t in p["tokens"]
+                 if t["t"] == "fig" and t["fact"] in facts and D(facts[t["fact"]]["value"]) != 0
+             ]) >= 2),
+            None,
+        )
+        if paragraph is None:
+            return None
+        tokens = [
+            t for t in paragraph["tokens"]
+            if t["t"] == "fig" and t["fact"] in facts and D(facts[t["fact"]]["value"]) != 0
+        ]
+        _restate(tokens[0], facts[tokens[0]["fact"]], "sign")
+        _restate(tokens[1], facts[tokens[1]["fact"]], "scale")
+        return {"sections": mutated, "hint": "VALUE_MISMATCH"}
+
+    if mutation == "wrong_comparator_and_scope":
+        if len(figures) < 2:
+            return None
+        variance = next(
+            (v for v in recon["variances"] if v["variance_id"] == target_section["variance_id"]),
+            None,
+        )
+        if variance is None:
+            return None
+        other = next(
+            (f for f in facts.values()
+             if f["kind"] == "actual" and f["entity"] != variance["entity"]
+             and f["account"] == variance["account"] and f["account"] is not None),
+            None,
+        )
+        if other is None:
+            return None
+        # One figure measured against the wrong comparator, one borrowed from
+        # another entity. The gate must surface both, not just the first hit.
+        figures[0][1]["fact"] = variance["fact_ids"]["variance_prior"]
+        figures[1][1]["fact"] = other["fact_id"]
+        return {"sections": mutated, "hint": "BASIS_MISMATCH+SCOPE_MISMATCH"}
 
     if mutation == "wrong_scope":
         variance = next(v for v in recon["variances"] if v["variance_id"] == target_section["variance_id"])
@@ -645,46 +741,27 @@ def _mutate(sections: list[dict], mutation: str, facts: dict[str, dict], recon: 
         )
         if other is None:
             return None
-        _, token = first_fig(target_section)
-        if token is None:
-            return None
-        token["fact"] = other["fact_id"]
+        figures[0][1]["fact"] = other["fact_id"]
         return {"sections": mutated, "hint": "SCOPE_MISMATCH"}
 
     if mutation == "basis_swap":
         variance = next(v for v in recon["variances"] if v["variance_id"] == target_section["variance_id"])
-        _, token = first_fig(target_section)
-        if token is None:
-            return None
-        token["fact"] = variance["fact_ids"]["variance_prior"]
+        figures[0][1]["fact"] = variance["fact_ids"]["variance_prior"]
         return {"sections": mutated, "hint": "BASIS_MISMATCH"}
 
-    paragraph, token = first_fig(target_section)
-    if token is None:
-        return None
+    paragraph, token = figures[0]
     fact = facts.get(token["fact"])
     if fact is None:
         return None
-    value = D(fact["value"])
-    if token.get("sign_mode") == "absolute":
-        value = abs(value)
-    scale = D(token.get("scale", "1"))
-    decimals = token.get("decimals", 0)
-    step = Decimal(1).scaleb(-decimals)
 
     if mutation == "scale_error":
-        shown = (value * 1000 / scale).quantize(step)
+        _restate(token, fact, "scale")
     elif mutation == "sign_flip":
-        shown = -(value / scale).quantize(step)
+        _restate(token, fact, "sign")
     elif mutation == "rounding_drift":
-        shown = (value / scale).quantize(step) + step
+        _restate(token, fact, "round")
     else:
         return None
-
-    token["number"] = str(shown)
-    from app.money import fmt_money, fmt_pct
-
-    token["text"] = fmt_pct(shown / 100, decimals)["text"] if fact["unit"] == "pct" else _money_from_number(shown, token, scale)
     return {"sections": mutated, "hint": "VALUE_MISMATCH"}
 
 
@@ -715,13 +792,15 @@ def self_test(sections: list[dict], facts: dict[str, dict], recon: dict) -> dict
             })
             continue
         local = Findings()
-        _check_sections(mutated["sections"], facts, recon, local, check_coverage=False)
+        local_stats = _check_sections(mutated["sections"], facts, recon, local, check_coverage=False)
         categories = sorted(local.categories())
+        failed_figures = len([c for c in local_stats["claims"] if c["status"] == "fail"])
         results.append({
             "mutation": mutation,
             "description": description,
             "detected": bool(categories),
             "categories": categories,
+            "failed_figures": failed_figures,
             "expected": mutated["hint"],
             "skipped": False,
         })

@@ -240,11 +240,37 @@ def test_clean_run_passes_every_layer() -> None:
 
 def test_verifier_self_test_detects_every_mutation() -> None:
     self_test = VERIFIED["self_test"]
-    assert self_test["total"] == 6 and self_test["detected"] == 6
+    assert self_test["total"] == 9 and self_test["detected"] == 9
     assert self_test["passed"] is True
     names = {m["mutation"] for m in self_test["mutations"]}
-    assert names == {"scale_error", "sign_flip", "rounding_drift", "unsourced_figure", "wrong_scope", "basis_swap"}
+    assert names == {
+        "scale_error", "sign_flip", "rounding_drift", "unsourced_figure",
+        "wrong_scope", "basis_swap", "summary_section_scale",
+        "two_figure_sign_and_scale", "wrong_comparator_and_scope",
+    }
     assert all(m["detected"] and m["categories"] for m in self_test["mutations"])
+
+
+def test_self_test_covers_summary_and_compound_mutations() -> None:
+    by_name = {m["mutation"]: m for m in VERIFIED["self_test"]["mutations"]}
+
+    # The summary is the most-read section, so it is attacked directly.
+    summary = by_name["summary_section_scale"]
+    assert summary["detected"] is True
+    assert "VALUE_MISMATCH" in summary["categories"]
+
+    # A sign flip and a scale error in the same paragraph both fail.
+    compound = by_name["two_figure_sign_and_scale"]
+    assert compound["detected"] is True
+    assert "VALUE_MISMATCH" in compound["categories"]
+    assert compound["failed_figures"] == 2
+
+    # A wrong comparator and a wrong entity in one section surface both
+    # categories, not just whichever figure is checked first.
+    both = by_name["wrong_comparator_and_scope"]
+    assert both["detected"] is True
+    assert {"BASIS_MISMATCH", "SCOPE_MISMATCH"} <= set(both["categories"])
+    assert both["failed_figures"] == 2
 
 
 def test_drift_is_blocked() -> None:

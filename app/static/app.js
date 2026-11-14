@@ -745,7 +745,7 @@ function renderVerify() {
       <td class="mono small">${esc(m.mutation)}</td>
       <td class="small muted">${esc(m.description)}</td>
       <td><span class="tag ${m.detected ? "tag-pass" : "tag-block"}">${m.detected ? "detected" : m.skipped ? "skipped" : "missed"}</span></td>
-      <td class="mono xsmall">${esc(m.categories.join(", ") || "—")}</td>
+      <td class="mono xsmall">${esc(m.categories.join(", ") || "—")}${m.failed_figures > 1 ? ` <span class="muted">· ${m.failed_figures} figures</span>` : ""}</td>
     </tr>`).join("");
 
   return `
