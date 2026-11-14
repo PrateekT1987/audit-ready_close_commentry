@@ -24,6 +24,7 @@ os.environ["FINCOM_DB"] = str(_TMP / "close.db")
 
 from app import config, store  # noqa: E402
 from app.engine import audit  # noqa: E402
+from app.engine import verify as verify_engine  # noqa: E402
 from app.engine.narrate import narrate  # noqa: E402
 from app.engine.reconcile import reconcile  # noqa: E402
 from app.engine.verify import verify  # noqa: E402
@@ -240,13 +241,14 @@ def test_clean_run_passes_every_layer() -> None:
 
 def test_verifier_self_test_detects_every_mutation() -> None:
     self_test = VERIFIED["self_test"]
-    assert self_test["total"] == 9 and self_test["detected"] == 9
+    assert self_test["total"] == 10 and self_test["detected"] == 10
     assert self_test["passed"] is True
     names = {m["mutation"] for m in self_test["mutations"]}
     assert names == {
         "scale_error", "sign_flip", "rounding_drift", "unsourced_figure",
         "wrong_scope", "basis_swap", "summary_section_scale",
         "two_figure_sign_and_scale", "wrong_comparator_and_scope",
+        "prose_comparator_swap",
     }
     assert all(m["detected"] and m["categories"] for m in self_test["mutations"])
 
@@ -271,6 +273,98 @@ def test_self_test_covers_summary_and_compound_mutations() -> None:
     assert both["detected"] is True
     assert {"BASIS_MISMATCH", "SCOPE_MISMATCH"} <= set(both["categories"])
     assert both["failed_figures"] == 2
+
+    # Prose can name the wrong comparator while every figure stays correct.
+    prose = by_name["prose_comparator_swap"]
+    assert prose["detected"] is True
+    assert prose["categories"] == ["COMPARATOR_MISMATCH"]
+
+
+def _claim_categories(text: str, variance: dict) -> set[str]:
+    section = {
+        "section_id": "S-99",
+        "scope": {"entity": "US01", "account": "1000", "period": "2026-10", "comparator": "budget"},
+    }
+    findings = verify_engine.Findings()
+    verify_engine._check_semantics(section, {"role": "movement"}, text, variance, RECON, findings)
+    return findings.categories()
+
+
+def test_semantic_direction_and_comparator_extraction() -> None:
+    claims = verify_engine.extract_direction_claims(
+        "Revenue came in at $4.56M, above the revised plan of $4.39M by $167.8K."
+    )
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim["subject"] == "Revenue"
+    assert claim["verb"] == "came in at"
+    assert claim["direction"] == "up"
+    assert claim["comparator"] == "forecast"
+    assert claim["comparator_phrase"] == "revised plan"
+
+    inline = verify_engine.extract_direction_claims("Cash came in at $0.00, in line with plan.")
+    assert inline[0]["direction"] == "inline"
+    assert inline[0]["comparator"] == "budget"
+
+    # One sentence can carry two claims with different subjects and directions.
+    multi = verify_engine.extract_direction_claims(
+        "Operating expenses of $7.20M were above plan by $474.4K, so operating income "
+        "closed at $1.24M, below the planned $1.48M."
+    )
+    assert [c["metric"] for c in multi] == ["opex_total", "operating_income"]
+    assert [c["direction"] for c in multi] == ["up", "down"]
+
+
+def test_prose_comparator_must_match_section_scope() -> None:
+    # Every claim in the clean commentary names the comparator its section covers.
+    for section in STRICT["sections"]:
+        for paragraph in section["paragraphs"]:
+            text = "".join(
+                token["v"] if token["t"] == "text" else token["text"]
+                for token in paragraph["tokens"]
+            )
+            for claim in verify_engine.extract_direction_claims(text):
+                assert claim["comparator"] == section["scope"]["comparator"]
+
+    variance = {
+        "variance_id": "V-999",
+        "variance_usd": "167849.10",
+        "favorability": "favorable",
+        "account_short": "Revenue",
+    }
+    wrong = _claim_categories(
+        "Revenue came in at $4.56M, above the revised plan of $4.39M by $167.8K.", variance
+    )
+    assert "COMPARATOR_MISMATCH" in wrong
+    right = _claim_categories(
+        "Revenue came in at $4.56M, above the plan of $4.39M by $167.8K.", variance
+    )
+    assert right == set()
+
+
+def test_direction_semantics_handle_zero_and_inline() -> None:
+    zero = {
+        "variance_id": "V-998",
+        "variance_usd": "0.00",
+        "favorability": "neutral",
+        "account_short": "Cash",
+    }
+    # A hard-zero variance cannot be described as a movement in either direction.
+    assert "DIRECTION_CONFLICT" in _claim_categories(
+        "Cash came in at $0.00, above the plan by $0.00.", zero
+    )
+    assert "DIRECTION_CONFLICT" in _claim_categories(
+        "Cash closed at $0.00, below plan.", zero
+    )
+    # "In line with plan" is the correct description of zero.
+    assert _claim_categories("Cash came in at $0.00, in line with plan.", zero) == set()
+
+    # And a real movement cannot hide behind "in line".
+    nonzero = {**zero, "variance_usd": "150000.00"}
+    assert "DIRECTION_CONFLICT" in _claim_categories(
+        "Cash came in at $150.0K, in line with plan.", nonzero
+    )
+    assert _claim_categories("Cash came in at $150.0K, above plan.", nonzero) == set()
 
 
 def test_drift_is_blocked() -> None:

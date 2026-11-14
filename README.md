@@ -70,22 +70,28 @@ independent layers:
   cites a fact, and check the displayed value rounds from that fact at the
   stated scale and precision.
 * **Claim → section (L2):** every cited fact must belong to the section it
-  appears in, and the direction and favorability language must agree with the
-  fact's sign and the account's policy.
+  appears in. Direction and comparator language is parsed as a grammar —
+  subject, verb, direction phrase and comparator phrase — rather than matched
+  against a word list. "Above plan", "in line with plan" and "above the revised
+  plan" are distinguished, and the comparator named in prose must be the one
+  the section covers. Favorability language must agree with the account's
+  policy.
 * **Fact → source (L3):** re-derive all 862 facts from the raw journal lines,
   plan rows and FX table, including presentation sign and Balance Sheet
   roll-forward. A stored fact is never taken at face value.
 * **Narrative quality:** materiality coverage (12/12), driver disclosure,
   attribution closure (12/12), and unsourced-figure detection.
 
-On every verification run the verifier also attacks itself with nine mutations:
+On every verification run the verifier also attacks itself with ten mutations:
 `scale_error`, `sign_flip`, `rounding_drift`, `unsourced_figure`,
 `wrong_scope`, `basis_swap`, `summary_section_scale`,
-`two_figure_sign_and_scale`, `wrong_comparator_and_scope`. The last three attack
-the summary section and compound edits — a sign flip plus a scale error in one
-paragraph, and a wrong comparator plus a wrong entity in one section. The run
-reports how many it caught and how many figures each mutation broke (currently
-9/9), so the gate is demonstrated rather than asserted.
+`two_figure_sign_and_scale`, `wrong_comparator_and_scope`,
+`prose_comparator_swap`. They cover the summary section and compound edits — a
+sign flip plus a scale error in one paragraph, a wrong comparator plus a wrong
+entity in one section, and prose that names a revised plan while the section is
+scoped to budget. The run reports how many it caught and how many figures each
+mutation broke (currently 10/10), so the gate is demonstrated rather than
+asserted.
 
 ### 4. Sign off
 
@@ -147,10 +153,11 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-26 tests cover the money round-trip, reconcile invariants, the blocking
+29 tests cover the money round-trip, reconcile invariants, the blocking
 trial-balance proof, sequence-ordered chain verification, period-correct
-narration, separation of duties, fact-bound
-narration, the clean and adversarial verification outcomes, the nine-mutation
+narration, separation of duties, semantic direction and comparator parsing,
+fact-bound
+narration, the clean and adversarial verification outcomes, the ten-mutation
 self-test (including summary and compound edits), sign-off refusal, chain tamper
 detection, evidence-pack manifests and the HTTP surface. No pytest dependency.
 
@@ -207,7 +214,7 @@ app/
   engine/
     reconcile.py       trial balance, variances, drivers, controls, facts
     narrate.py         fact-constrained claim plan (+ deliberate drift mode)
-    verify.py          four verification layers + nine-mutation self-test
+    verify.py          four verification layers + ten-mutation self-test
     audit.py           hashes, preflight, signature, chain, exports
   static/
     index.html         single page

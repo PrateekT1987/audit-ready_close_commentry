@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from decimal import Decimal
 
 from app import config
@@ -28,8 +29,157 @@ BLOCK = "block"
 WARN = "warn"
 INFO = "info"
 
-UP_WORDS = ("above", "increase", "increased", "higher", "exceeded", "over plan", "ahead of")
-DOWN_WORDS = ("below", "decrease", "decreased", "lower", "short of", "under plan")
+# Direction and comparator phrases are parsed as a grammar, not matched as
+# loose keywords: `<subject> <verb> <direction phrase> <comparator phrase>`.
+# This lets the gate read "in line with plan" and "above the revised plan"
+# correctly, including the comparator the prose actually names.
+DIRECTION_PHRASES = [
+    # the longest phrase at a position wins ("in line with" over "in line")
+    ("in line with", "inline"),
+    ("on plan", "inline"),
+    ("on budget", "inline"),
+    ("at plan", "inline"),
+    ("flat against", "inline"),
+    ("in line", "inline"),
+    ("matched plan", "inline"),
+    ("ahead of", "up"),
+    ("higher than", "up"),
+    ("exceeded", "up"),
+    ("surpassed", "up"),
+    ("above", "up"),
+    ("over", "up"),
+    ("short of", "down"),
+    ("lower than", "down"),
+    ("behind", "down"),
+    ("missed", "down"),
+    ("below", "down"),
+    ("under", "down"),
+]
+
+COMPARATOR_PHRASES = [
+    ("revised forecast", "forecast"),
+    ("revised plan", "forecast"),
+    ("revised budget", "forecast"),
+    ("latest forecast", "forecast"),
+    ("plan of record", "budget"),
+    ("prior period", "prior"),
+    ("prior month", "prior"),
+    ("previous period", "prior"),
+    ("previous month", "prior"),
+    ("prior year", "prior"),
+    ("last month", "prior"),
+    ("last period", "prior"),
+    ("forecast", "forecast"),
+    ("planned", "budget"),
+    ("budgeted", "budget"),
+    ("budget", "budget"),
+    ("target", "budget"),
+    ("plan", "budget"),
+]
+
+# Subjects map to the group aggregate they talk about, so the summary section
+# is checked figure by figure rather than as one undifferentiated movement.
+SUBJECT_METRICS = [
+    ("cost of revenue", "cost_of_revenue"),
+    ("net income", "net_income"),
+    ("operating income", "operating_income"),
+    ("operating expenses", "opex_total"),
+    ("operating expense", "opex_total"),
+    ("opex", "opex_total"),
+    ("gross profit", "gross_profit"),
+    ("ebitda", "ebitda"),
+    ("revenue", "revenue_total"),
+]
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_CLAUSE_SPLIT = re.compile(r"[,;]")
+_SUBJECT_SPLIT = re.compile(r"\b(came in at|closed at|came in|closed|was|were|is|are)\b", re.IGNORECASE)
+
+
+def _direction_matches(sentence: str) -> list[tuple[int, str, str]]:
+    """Every direction phrase in the sentence, ordered by position."""
+    lowered = sentence.lower()
+    matches: dict[int, tuple[str, str]] = {}
+    for phrase, direction in DIRECTION_PHRASES:
+        for match in re.finditer(rf"\b{re.escape(phrase)}\b", lowered):
+            position = match.start()
+            current = matches.get(position)
+            if current is None or len(phrase) > len(current[0]):
+                matches[position] = (phrase, direction)
+    return [(position, *matches[position]) for position in sorted(matches)]
+
+
+def _comparator_after(sentence: str, end: int) -> tuple[str, str | None]:
+    """The comparator phrase immediately following a direction phrase."""
+    window = sentence[end:end + 40].lower()
+    best: tuple[int, str, str] | None = None
+    for phrase, comparator in COMPARATOR_PHRASES:
+        match = re.search(rf"\b{re.escape(phrase)}\b", window)
+        if match is None:
+            continue
+        position = match.start()
+        if position > 24:
+            continue
+        if best is None or position < best[0] or (position == best[0] and len(phrase) > len(best[1])):
+            best = (position, phrase, comparator)
+    if best is None:
+        return "", None
+    return best[1], best[2]
+
+
+def _subject_and_verb(segment: str) -> tuple[str, str]:
+    clause = _CLAUSE_SPLIT.split(segment.strip(" ,;"))[-1]
+    match = _SUBJECT_SPLIT.search(clause)
+    if match:
+        subject = clause[:match.start()]
+        verb = match.group(0)
+    else:
+        subject = clause
+        verb = ""
+    subject = re.sub(r"^(?:and|but|so|while|whereas)\s+", "", subject.strip(" ,;:.()"), flags=re.IGNORECASE)
+    return subject, verb.lower()
+
+
+def _metric_for_subject(subject: str) -> str | None:
+    lowered = subject.lower()
+    for phrase, metric in SUBJECT_METRICS:
+        if phrase in lowered:
+            return metric
+    return None
+
+
+def extract_direction_claims(text: str) -> list[dict]:
+    """Parse direction claims out of prose: subject, direction, comparator.
+
+    Each claim is one `<direction phrase> <comparator phrase>` pair, with the
+    subject taken from the clause that introduces it. A phrase pair without a
+    comparator is not a claim ("under management's control" says nothing about
+    plan). A sentence can carry several claims, which is common in the summary.
+    """
+    claims: list[dict] = []
+    for sentence in _SENTENCE_SPLIT.split(text):
+        previous_end = 0
+        for start, phrase, direction in _direction_matches(sentence):
+            comparator_phrase, comparator = _comparator_after(sentence, start + len(phrase))
+            if comparator is not None:
+                subject, verb = _subject_and_verb(sentence[previous_end:start])
+                claims.append({
+                    "sentence": sentence.strip(),
+                    "subject": subject,
+                    "verb": verb,
+                    "metric": _metric_for_subject(subject),
+                    "direction": direction,
+                    "direction_phrase": phrase,
+                    "comparator": comparator,
+                    "comparator_phrase": comparator_phrase,
+                })
+            previous_end = start + len(phrase)
+    return claims
+
+
+def _zero(value: Decimal) -> bool:
+    return abs(value) < Decimal("0.005")
+
 
 
 class Findings:
@@ -226,7 +376,7 @@ def _check_sections(
 
             text = "".join(plain_parts)
             stats["words"] += len(text.split())
-            _check_word_semantics(section, paragraph, text, variance, findings)
+            _check_semantics(section, paragraph, text, variance, recon, findings)
 
             if paragraph.get("role") == "attribution" and variance is not None:
                 driver_facts = {d["fact_id"] for d in variance["drivers"]}
@@ -502,37 +652,85 @@ def _check_scope(fact: dict, scope: dict, section: dict, para_index: int, token:
         )
 
 
-def _check_word_semantics(section: dict, paragraph: dict, text: str, variance: dict | None, findings: Findings) -> None:
-    lowered = text.lower()
+def _expected_claim_variance(claim: dict, variance: dict | None, recon: dict) -> tuple[Decimal | None, str]:
+    """The variance the claim is talking about, and a label for the subject."""
+    if variance is not None:
+        return D(variance["variance_usd"]), variance.get("account_short") or variance["variance_id"]
+    metric = claim.get("metric")
+    if not metric:
+        return None, ""
+    aggregate = next((a for a in recon["aggregates"] if a["aggregate_id"] == metric), None)
+    if aggregate is None:
+        return None, ""
+    return D(aggregate["value_usd"]["variance"]), aggregate["label"]
 
-    if paragraph.get("role") == "movement" and variance is not None:
-        value = D(variance["variance_usd"])
-        up_hits = [word for word in UP_WORDS if word in lowered]
-        down_hits = [word for word in DOWN_WORDS if word in lowered]
-        if value > 0 and down_hits and not up_hits:
+
+def _check_semantics(
+    section: dict,
+    paragraph: dict,
+    text: str,
+    variance: dict | None,
+    recon: dict,
+    findings: Findings,
+) -> None:
+    scope = section["scope"]
+    for claim in extract_direction_claims(text):
+        # The prose names a comparator; it must be the one the section covers.
+        if claim["comparator"] and scope.get("comparator") and claim["comparator"] != scope["comparator"]:
             findings.add(
                 BLOCK,
-                "DIRECTION_CONFLICT",
-                f"{section['section_id']} describes the movement as '{down_hits[0]}' but the variance is "
-                f"{variance['variance_usd']} USD (an increase).",
+                "COMPARATOR_MISMATCH",
+                f"{section['section_id']} compares {claim['subject'] or 'the movement'} to the "
+                f"{claim['comparator']} comparator ('{claim['comparator_phrase']}'), but the section is "
+                f"scoped to the {scope['comparator']} comparator.",
                 section_id=section["section_id"],
-                variance_id=section["variance_id"],
-                claim=down_hits[0],
+                variance_id=section.get("variance_id"),
+                claim=claim["direction_phrase"],
+                detail={
+                    "subject": claim["subject"],
+                    "verb": claim["verb"],
+                    "comparator_phrase": claim["comparator_phrase"],
+                    "prose_comparator": claim["comparator"],
+                    "scope_comparator": scope.get("comparator"),
+                },
             )
-        if value < 0 and up_hits and not down_hits:
-            findings.add(
-                BLOCK,
-                "DIRECTION_CONFLICT",
-                f"{section['section_id']} describes the movement as '{up_hits[0]}' but the variance is "
-                f"{variance['variance_usd']} USD (a decrease).",
-                section_id=section["section_id"],
-                variance_id=section["variance_id"],
-                claim=up_hits[0],
-            )
+
+        expected, subject_label = _expected_claim_variance(claim, variance, recon)
+        if expected is None:
+            continue
+
+        direction = claim["direction"]
+        if direction == "inline":
+            conflict = not _zero(expected)
+        elif direction == "up":
+            conflict = expected < 0 or _zero(expected)
+        else:  # down
+            conflict = expected > 0 or _zero(expected)
+        if not conflict:
+            continue
+
+        findings.add(
+            BLOCK,
+            "DIRECTION_CONFLICT",
+            f"{section['section_id']} describes {subject_label or claim['subject'] or 'the movement'} as "
+            f"{claim['direction_phrase']} {claim['comparator_phrase']}, but the variance is "
+            f"{expected} USD.",
+            section_id=section["section_id"],
+            variance_id=section.get("variance_id"),
+            claim=claim["sentence"],
+            detail={
+                "subject": claim["subject"],
+                "verb": claim["verb"],
+                "direction": direction,
+                "direction_phrase": claim["direction_phrase"],
+                "comparator_phrase": claim["comparator_phrase"],
+                "variance_usd": str(expected),
+            },
+        )
 
     if variance is not None and paragraph.get("role") == "movement":
-        stated_unfav = "unfavorable" in lowered
-        stated_fav = "favorable" in lowered and not stated_unfav
+        stated_unfav = "unfavorable" in text.lower()
+        stated_fav = "favorable" in text.lower() and not stated_unfav
         if stated_unfav and variance["favorability"] != "unfavorable":
             findings.add(
                 BLOCK,
@@ -615,6 +813,7 @@ MUTATIONS = [
     ("summary_section_scale", "The most-read section restated at the wrong scale"),
     ("two_figure_sign_and_scale", "Two figures in one paragraph changed: one sign-flipped, one rescaled"),
     ("wrong_comparator_and_scope", "One figure on the wrong basis and another from the wrong entity, together"),
+    ("prose_comparator_swap", "The prose names a revised plan while the section is scoped to budget"),
 ]
 
 
@@ -730,6 +929,13 @@ def _mutate(sections: list[dict], mutation: str, facts: dict[str, dict], recon: 
         figures[0][1]["fact"] = variance["fact_ids"]["variance_prior"]
         figures[1][1]["fact"] = other["fact_id"]
         return {"sections": mutated, "hint": "BASIS_MISMATCH+SCOPE_MISMATCH"}
+
+    if mutation == "prose_comparator_swap":
+        for token in target_section["paragraphs"][0]["tokens"]:
+            if token["t"] == "text" and " plan" in token["v"]:
+                token["v"] = token["v"].replace(" plan", " revised plan", 1)
+                return {"sections": mutated, "hint": "COMPARATOR_MISMATCH"}
+        return None
 
     if mutation == "wrong_scope":
         variance = next(v for v in recon["variances"] if v["variance_id"] == target_section["variance_id"])
