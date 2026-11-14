@@ -230,21 +230,73 @@ _SCALED_IN_TEXT = re.compile(r"\b\d[\d,]*(\.\d+)?\s?(bn|mn|[KkMmBb])\b")
 _PCT_IN_TEXT = re.compile(r"\b\d[\d,]*(\.\d+)?\s?%")
 _THOUSANDS_IN_TEXT = re.compile(r"\b\d{1,3}(,\d{3})+(\.\d+)?\b")
 
+# A closed vocabulary of quantity words. A spelled-out amount, a fraction or a
+# deliberately vague quantity is just as much a figure as "$40K"; if it appears
+# in prose it must carry provenance like any other figure.
+_NUMBER_WORD = (
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    r"hundred|thousand|million|billion|trillion)"
+)
+_NUMBER_WORDS = rf"\b{_NUMBER_WORD}(?:[\s-]+(?:and[\s-]+)?{_NUMBER_WORD})*\b"
+_SCALE_WORD = r"(?:hundred|thousand|million|billion|trillion)"
+_AMOUNT_UNIT = (
+    r"(?:dollars?|cents?|euros?|pounds?|sterling|yen|usd|eur|gbp|sgd|"
+    r"percent|per\s+cent|basis\s+points?|bps)"
+)
+_SPELLED_AMOUNT_IN_TEXT = re.compile(
+    rf"(?:{_NUMBER_WORDS}\s+{_AMOUNT_UNIT}|{_NUMBER_WORDS}\s+{_SCALE_WORD})",
+    re.IGNORECASE,
+)
+_FRACTION_IN_TEXT = re.compile(
+    r"\b(?:a|one|two|three|four|five|six|seven|eight|nine|ten)[\s-]+"
+    r"(?:half|halves|thirds?|fourths?|fifths?|sixths?|sevenths?|eighths?|ninths?|tenths?|quarters?)"
+    r"[\s-]+of\b",
+    re.IGNORECASE,
+)
+_APPROXIMATE_NUMBER_IN_TEXT = re.compile(
+    r"\b(?:about|roughly|approximately|around|circa|nearly|almost|some|over|under|"
+    r"up to|more than|less than|at least|at most)\s+\d[\d,]*(?:\.\d+)?\b",
+    re.IGNORECASE,
+)
+_BARE_NUMBER_IN_TEXT = re.compile(r"(?<![\w.,\d])\d{1,3}(?:\.\d+)?(?![\d,])")
+_VAGUE_QUANTITY_IN_TEXT = re.compile(
+    r"\b(?:a couple of|a few|dozens? of|hundreds? of|thousands? of|millions? of|billions? of)\b",
+    re.IGNORECASE,
+)
+
+_QUANTITY_PATTERNS = (
+    _MONEY_IN_TEXT,
+    _SCALED_IN_TEXT,
+    _PCT_IN_TEXT,
+    _THOUSANDS_IN_TEXT,
+    _SPELLED_AMOUNT_IN_TEXT,
+    _FRACTION_IN_TEXT,
+    _APPROXIMATE_NUMBER_IN_TEXT,
+    _BARE_NUMBER_IN_TEXT,
+    _VAGUE_QUANTITY_IN_TEXT,
+)
+
 
 def find_figures_in_text(text: str) -> list[str]:
     """Every figure-looking substring in a run of prose.
 
-    Deliberately conservative: bare four-digit years, quarter labels and
-    small integers ("two regional events") are not figures. Currency amounts,
-    percentages, scaled amounts and thousands-separated numbers are.
+    Figures are a closed vocabulary: currency amounts, percentages, scaled and
+    thousands-separated numbers, spelled-out amounts ("forty thousand
+    dollars"), fractions ("a fifth of"), approximate numbers ("roughly 40"),
+    bare quantities and vague quantifiers ("hundreds of"). Four-digit years,
+    quarter labels, hyphenated compounds ("one-off") and counts written as
+    words without a unit ("two regional events") remain prose, not figures.
     """
     candidates: list[str] = []
-    for pattern in (_MONEY_IN_TEXT, _SCALED_IN_TEXT, _PCT_IN_TEXT, _THOUSANDS_IN_TEXT):
+    for pattern in _QUANTITY_PATTERNS:
         for match in pattern.finditer(text):
             candidate = match.group(0).strip()
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
-    # Drop a match that is fully contained in a longer one ("40K" inside "$40K").
+    # Drop a match that is fully contained in a longer one ("40K" inside "$40K",
+    # "40" inside "roughly 40").
     kept: list[str] = []
     for candidate in sorted(candidates, key=len, reverse=True):
         if not any(candidate in other for other in kept):

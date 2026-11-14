@@ -31,6 +31,7 @@ from app.engine.verify import verify  # noqa: E402
 from app.money import (  # noqa: E402
     ParseError,
     expected_display_number,
+    find_figures_in_text,
     fmt_money,
     fmt_pct,
     parse_display,
@@ -84,6 +85,53 @@ def test_parser_rejects_prose() -> None:
         except ParseError:
             continue
         raise AssertionError(f"parse_display accepted {bad!r}")
+
+
+def test_quantity_scanner_catches_spelled_and_vague_quantities() -> None:
+    # Anything that reads as a quantity is a figure, however it is written.
+    cases = {
+        "forty thousand dollars of accrued spend": "forty thousand dollars",
+        "roughly 40 of accrued spend": "roughly 40",
+        "a fifth of revenue": "a fifth of",
+        "two-thirds of the movement": "two-thirds of",
+        "fifteen percent of the base": "fifteen percent",
+        "two million in accruals": "two million",
+        "hundreds of invoices": "hundreds of",
+        "40 days": "40",
+    }
+    for text, expected in cases.items():
+        found = find_figures_in_text(text)
+        assert expected in found, f"{text!r} -> {found!r}"
+
+    # Prose that only looks numeric stays prose: years, quarter labels,
+    # hyphenated compounds and unitless spelled counts.
+    for text in (
+        "October 2026",
+        "Q4 brand campaign",
+        "one-off items",
+        "two regional field events",
+        "net twenty-two hires in engineering",
+        "the top twenty accounts",
+        "the remaining quarter",
+    ):
+        assert find_figures_in_text(text) == [], text
+
+
+def test_spelled_out_quantity_blocks_the_section() -> None:
+    import copy
+
+    sections = copy.deepcopy(STRICT["sections"])
+    sections[0]["paragraphs"][0]["tokens"].append({
+        "t": "text",
+        "v": " A further forty thousand dollars of accrued spend is expected to unwind.",
+    })
+    findings = verify_engine.Findings()
+    facts = {f["fact_id"]: f for f in RECON["facts"]}
+    verify_engine._check_sections(sections, facts, RECON, findings, check_coverage=False)
+    blocks = [f for f in findings.items if f["severity"] == "block"]
+    assert [f["category"] for f in blocks] == ["UNSOURCED_FIGURE"]
+    assert blocks[0]["claim"] == "forty thousand dollars"
+    assert blocks[0]["section_id"] == STRICT["sections"][0]["section_id"]
 
 
 # ------------------------------------------------------------- reconcile
@@ -241,16 +289,24 @@ def test_clean_run_passes_every_layer() -> None:
 
 def test_verifier_self_test_detects_every_mutation() -> None:
     self_test = VERIFIED["self_test"]
-    assert self_test["total"] == 10 and self_test["detected"] == 10
+    assert self_test["total"] == 11 and self_test["detected"] == 11
     assert self_test["passed"] is True
     names = {m["mutation"] for m in self_test["mutations"]}
     assert names == {
         "scale_error", "sign_flip", "rounding_drift", "unsourced_figure",
-        "wrong_scope", "basis_swap", "summary_section_scale",
-        "two_figure_sign_and_scale", "wrong_comparator_and_scope",
-        "prose_comparator_swap",
+        "spelled_out_amount", "wrong_scope", "basis_swap",
+        "summary_section_scale", "two_figure_sign_and_scale",
+        "wrong_comparator_and_scope", "prose_comparator_swap",
     }
     assert all(m["detected"] and m["categories"] for m in self_test["mutations"])
+
+
+def test_self_test_covers_spelled_out_quantities() -> None:
+    by_name = {m["mutation"]: m for m in VERIFIED["self_test"]["mutations"]}
+    spelled = by_name["spelled_out_amount"]
+    assert spelled["detected"] is True
+    assert spelled["categories"] == ["UNSOURCED_FIGURE"]
+    assert spelled["skipped"] is False
 
 
 def test_self_test_covers_summary_and_compound_mutations() -> None:

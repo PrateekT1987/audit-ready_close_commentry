@@ -808,6 +808,7 @@ MUTATIONS = [
     ("sign_flip", "A figure restated with the opposite sign"),
     ("rounding_drift", "A figure rounded one step away from the source value"),
     ("unsourced_figure", "A figure introduced into prose with no citation"),
+    ("spelled_out_amount", "A quantity written in words rather than rendered from a fact"),
     ("wrong_scope", "A figure borrowed from a different entity"),
     ("basis_swap", "A budget comparison replaced by the prior-period comparison"),
     ("summary_section_scale", "The most-read section restated at the wrong scale"),
@@ -879,6 +880,14 @@ def _mutate(sections: list[dict], mutation: str, facts: dict[str, dict], recon: 
     if mutation == "unsourced_figure":
         target_section["paragraphs"][0]["tokens"].append({
             "t": "text", "v": " A further $40K of accrued spend is expected to unwind.",
+        })
+        return {"sections": mutated, "hint": "UNSOURCED_FIGURE"}
+
+    if mutation == "spelled_out_amount":
+        # The same defect as an unsourced figure, written in words so that a
+        # digit-only scanner walks straight past it.
+        target_section["paragraphs"][0]["tokens"].append({
+            "t": "text", "v": " A further forty thousand dollars of accrued spend is expected to unwind.",
         })
         return {"sections": mutated, "hint": "UNSOURCED_FIGURE"}
 
