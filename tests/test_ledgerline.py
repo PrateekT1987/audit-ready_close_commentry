@@ -197,6 +197,25 @@ def test_narration_is_fact_bound() -> None:
                     assert token["unit"] in ("currency", "pct", "count")
 
 
+def test_narration_uses_the_recon_period() -> None:
+    raw = copy.deepcopy(RAW)
+    raw["meta"]["current_period"] = "2026-07"
+    recon = reconcile(raw)
+    commentary = narrate(recon, mode="strict")
+    summary = commentary["sections"][0]
+    assert recon["period"] == "2026-07"
+    assert summary["scope"]["period"] == "2026-07"
+    assert "July 2026" in summary["eyebrow"]
+    prose = " ".join(
+        token["v"]
+        for paragraph in summary["paragraphs"]
+        for token in paragraph["tokens"]
+        if token["t"] == "text"
+    )
+    assert "July 2026" in prose
+    assert "October 2026" not in prose
+
+
 def test_drift_injects_two_defects() -> None:
     assert DRIFT["mode"] == "drift"
     assert DRIFT["drift"]["applied"] is True

@@ -131,8 +131,9 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-22 tests cover the money round-trip, reconcile invariants, the blocking
-trial-balance proof, sequence-ordered chain verification, fact-bound
+23 tests cover the money round-trip, reconcile invariants, the blocking
+trial-balance proof, sequence-ordered chain verification, period-correct
+narration, fact-bound
 narration, the clean and adversarial verification outcomes, the six-mutation
 self-test, sign-off refusal, chain tamper detection, evidence-pack manifests
 and the HTTP surface. No pytest dependency.

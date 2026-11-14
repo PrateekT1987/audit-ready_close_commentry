@@ -89,14 +89,14 @@ def _join_clauses(clauses: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Plans
 # ---------------------------------------------------------------------------
-def _summary_section(agg: dict[str, dict], facts: dict[str, dict]) -> dict:
+def _summary_section(agg: dict[str, dict], facts: dict[str, dict], period: str) -> dict:
     revenue = agg["revenue_total"]
     gross = agg["gross_profit"]
     opex = agg["opex_total"]
     oi = agg["operating_income"]
     ebitda = agg["ebitda"]
     ni = agg["net_income"]
-    period_label = config.PERIOD_LABELS[config.CURRENT_PERIOD]
+    period_label = config.PERIOD_LABELS[period]
 
     def var_line(paragraph: Paragraph, block: dict) -> Paragraph:
         paragraph.t(" by ").money(facts[block["fact_ids"]["variance"]], absolute=True)
@@ -130,7 +130,7 @@ def _summary_section(agg: dict[str, dict], facts: dict[str, dict]) -> dict:
         "section_id": "S-01",
         "kind": "summary",
         "variance_id": None,
-        "scope": {"entity": "GRP", "account": None, "period": config.CURRENT_PERIOD, "comparator": "budget"},
+        "scope": {"entity": "GRP", "account": None, "period": period, "comparator": "budget"},
         "heading": "Group performance",
         "eyebrow": f"{config.GROUP_NAME} · consolidated · {period_label} · USD",
         "paragraphs": [p1.to_dict(), p2.to_dict(), p3.to_dict()],
@@ -253,7 +253,7 @@ def _variance_section(variance: dict, facts: dict[str, dict], index: int) -> dic
 def build_plan(recon: dict) -> list[dict]:
     facts = {f["fact_id"]: f for f in recon["facts"]}
     agg = {a["aggregate_id"]: a for a in recon["aggregates"]}
-    sections = [_summary_section(agg, facts)]
+    sections = [_summary_section(agg, facts, recon["period"])]
 
     material = [v for v in recon["variances"] if v["material"]]
     material.sort(key=lambda v: (v["entity"], -abs(D(v["variance_usd"]))))
