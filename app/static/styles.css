@@ -442,3 +442,25 @@ hr.rule { border: 0; border-top: 1px solid var(--line-2); margin: 14px 0; }
 .menu-pop button:hover { background: #f4f8f9; }
 .menu-pop .menu-note { padding: 5px 9px 6px; font-size: 9.5px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); }
 .menu-pop .menu-sub { display: block; font-size: 10.5px; color: var(--muted); margin-top: 1px; }
+
+/* ---------- run switcher, roll-forward pivot, comparison ---------- */
+.run-switch { display: inline-flex; align-items: center; gap: 6px; margin-left: 4px; }
+.run-switch select { max-width: 260px; height: 28px; font-size: 11px; padding: 0 6px; }
+.mode-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 2px; overflow: hidden; }
+.mode-toggle button {
+  background: #fff; border: 0; border-right: 1px solid var(--line); padding: 6px 10px;
+  font-size: 11px; cursor: pointer; color: var(--muted);
+}
+.mode-toggle button:last-child { border-right: 0; }
+.mode-toggle button.on { background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; }
+.rf-table th.rf-current { background: var(--accent-soft); color: var(--accent-ink); }
+.rf-cell { vertical-align: top; min-width: 104px; }
+.rf-cell.rf-current { background: #f4fafa; }
+.rf-cell.rf-empty { color: var(--muted); }
+.rf-actual { font-variant-numeric: tabular-nums; font-size: 12px; }
+.rf-var { font-variant-numeric: tabular-nums; font-size: 10.5px; color: var(--muted); }
+.rf-var.pos { color: var(--accent-ink); }
+.rf-var.neg { color: #8a1c1c; }
+tr.rf-group td { background: #fbfdfd; font-weight: 600; border-top: 1px solid var(--line); }
+.attest-template { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line-2); }
+.attest-template label.field { margin-bottom: 8px; }

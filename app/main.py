@@ -16,8 +16,10 @@ from pydantic import BaseModel, Field
 
 from app import config, store
 from app.engine import audit
+from app.engine.diff import diff_runs
 from app.engine.narrate import MODE_LABELS, narrate
 from app.engine.reconcile import reconcile
+from app.engine.rollforward import build_rollforward, dataset_for_period
 from app.engine.verify import verify
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -89,6 +91,13 @@ def _run_view(run: dict) -> dict:
             "label": run["label"],
             "preparer": governance["preparer"],
             "dual_control": governance["dual_control"],
+            "engine_version": recon.get("engine_version") or config.ENGINE_VERSION,
+            "verifier_version": verification.get("verifier_version") or config.VERIFIER_VERSION,
+        },
+        "versions": {
+            "engine": recon.get("engine_version") or config.ENGINE_VERSION,
+            "verifier": verification.get("verifier_version") or config.VERIFIER_VERSION,
+            "evidence_pack": config.EVIDENCE_PACK_VERSION,
         },
         "recon": {
             **{k: v for k, v in recon.items() if k != "facts"},
@@ -112,10 +121,7 @@ def _execute(period: str, mode: str) -> dict:
 
 
 def _dataset_for_period(period: str) -> dict:
-    raw = dataset()
-    if period and period != raw["meta"]["current_period"]:
-        raw = {**raw, "meta": {**raw["meta"], "current_period": period}}
-    return raw
+    return dataset_for_period(dataset(), period)
 
 
 class CreateRun(BaseModel):
@@ -131,7 +137,12 @@ class RenarrateRequest(BaseModel):
 
 class Attestation(BaseModel):
     finding_id: str
-    rationale: str
+    rationale: str = ""
+    control_id: str | None = None
+    remediation_owner: str | None = None
+    remediation_date: str | None = None
+    reviewed_by: str | None = None
+    details: dict[str, str] = Field(default_factory=dict)
 
 
 class SignOffRequest(BaseModel):
@@ -143,7 +154,14 @@ class SignOffRequest(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "service": "ledgerline", "version": app.version}
+    return {
+        "ok": True,
+        "service": "ledgerline",
+        "version": app.version,
+        "engine_version": config.ENGINE_VERSION,
+        "verifier_version": config.VERIFIER_VERSION,
+        "evidence_pack_version": config.EVIDENCE_PACK_VERSION,
+    }
 
 
 @app.get("/api/meta")
@@ -168,6 +186,12 @@ def meta() -> dict:
         },
         "modes": MODE_LABELS,
         "stages": config.STAGE_LABELS,
+        "versions": {
+            "engine": config.ENGINE_VERSION,
+            "verifier": config.VERIFIER_VERSION,
+            "evidence_pack": config.EVIDENCE_PACK_VERSION,
+        },
+        "attestation_templates": config.ATTESTATION_TEMPLATES,
     }
 
 
@@ -201,6 +225,8 @@ def create_run(body: CreateRun) -> dict:
         "status": status,
         "prepared_by": preparer,
         "dual_control": body.dual_control,
+        "engine_version": config.ENGINE_VERSION,
+        "verifier_version": config.VERIFIER_VERSION,
     })
     store.log_event(run_id, "close-engine", "reconcile.completed", payload["recon"]["stats"])
     store.log_event(run_id, "close-engine", "narrate.completed", {
@@ -226,6 +252,30 @@ def get_run(run_id: str) -> dict:
     if run is None:
         raise HTTPException(404, "run not found")
     return _run_view(run)
+
+
+@app.get("/api/runs/{run_id}/diff/{other_id}")
+def compare_runs(run_id: str, other_id: str) -> dict:
+    """What changed between two persisted runs of the close.
+
+    `run_id` is the base (left) run and `other_id` the comparison (right) run.
+    The response is a read model: no run, signature or event is modified.
+    """
+    base = store.load_run(run_id)
+    other = store.load_run(other_id)
+    if base is None or other is None:
+        raise HTTPException(404, "run not found")
+    base_signoffs = store.load_signoffs(run_id)
+    other_signoffs = store.load_signoffs(other_id)
+    _, links = _chain_state()
+    base_link = next((link for link in links if link["run_id"] == run_id), None)
+    return diff_runs(
+        base,
+        other,
+        base_signoff=base_signoffs[-1] if base_signoffs else None,
+        compare_signoff=other_signoffs[-1] if other_signoffs else None,
+        base_link=base_link,
+    )
 
 
 @app.post("/api/runs/{run_id}/renarrate")
@@ -392,6 +442,33 @@ def dataset_meta() -> dict:
         "driver_rows": len(raw["drivers"]),
         "intercompany_pairs": len({r["pair_id"] for r in raw["intercompany"]}),
         "exceptions": raw["exceptions"],
+    }
+
+
+@app.get("/api/rollforward")
+def rollforward_pivot(
+    entity: str = "ALL",
+    statement: str = "ALL",
+    material_only: bool = False,
+) -> dict:
+    """Period × account pivot, July → October with the current period last."""
+    data = build_rollforward(dataset())
+    rows = data["rows"]
+    if entity != "ALL":
+        rows = [row for row in rows if row["entity"] == entity]
+    if statement != "ALL":
+        rows = [row for row in rows if row["statement"] == statement]
+    if material_only:
+        rows = [row for row in rows if row["material_periods"]]
+    return {
+        **data,
+        "rows": rows,
+        "filter": {
+            "entity": entity,
+            "statement": statement,
+            "material_only": material_only,
+        },
+        "stats": {**data["stats"], "filtered_rows": len(rows)},
     }
 
 

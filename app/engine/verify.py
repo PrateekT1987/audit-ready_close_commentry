@@ -1445,6 +1445,8 @@ def verify(dataset: dict, recon: dict, commentary: dict) -> dict:
 
     return {
         "stage": "verify",
+        "engine_version": config.ENGINE_VERSION,
+        "verifier_version": config.VERIFIER_VERSION,
         "status": status,
         "findings": findings.items,
         "claims": claims,

@@ -159,3 +159,86 @@ STAGE_LABELS = {
     "verify": "Verify",
     "signoff": "Sign-off",
 }
+
+# ---------------------------------------------------------------------------
+# Version stamps
+# ---------------------------------------------------------------------------
+# A signed record must say which engine produced the commentary and which
+# verifier cleared it. Without these, a later change to either stage is
+# invisible in the certificate, and a re-run cannot be told apart from a
+# re-interpretation of the same evidence.
+ENGINE_VERSION = "1.1.0"
+VERIFIER_VERSION = "1.5.0"
+EVIDENCE_PACK_VERSION = "1.1"
+
+# ---------------------------------------------------------------------------
+# Attestation templates
+# ---------------------------------------------------------------------------
+# A warning is not discharged by a free-text sentence. Each category has a
+# small, auditable schema: a control break must name the control and say who
+# owns the fix and by when, so the record answers the question an auditor asks
+# next. Categories without a template still require a rationale.
+ATTESTATION_TEMPLATES: dict[str, dict] = {
+    "CONTROL_BREAK": {
+        "label": "Control break waiver",
+        "instruction": (
+            "Name the control that broke, the owner accountable for the fix and "
+            "the date by which it will be remediated."
+        ),
+        "fields": [
+            {
+                "name": "control_id",
+                "label": "Control reference",
+                "type": "text",
+                "required": True,
+                "auto_from_finding": "control_id",
+                "placeholder": "e.g. TB-SG03",
+            },
+            {
+                "name": "remediation_owner",
+                "label": "Remediation owner",
+                "type": "text",
+                "required": True,
+                "placeholder": "e.g. R. Tan, APAC Controller",
+            },
+            {
+                "name": "remediation_date",
+                "label": "Target remediation date",
+                "type": "date",
+                "required": True,
+            },
+        ],
+    },
+    "DRIVER_UNDISCLOSED": {
+        "label": "Attribution disclosure waiver",
+        "instruction": (
+            "Confirm who reviewed the undisclosed attribution and when the "
+            "narrative will be completed."
+        ),
+        "fields": [
+            {
+                "name": "reviewed_by",
+                "label": "Reviewed by",
+                "type": "text",
+                "required": True,
+                "placeholder": "e.g. Group FP&A lead",
+            },
+            {
+                "name": "remediation_date",
+                "label": "Target completion date",
+                "type": "date",
+                "required": True,
+            },
+        ],
+    },
+    "DEFAULT": {
+        "label": "Exception attestation",
+        "instruction": "Record why this exception is accepted and who reviewed it.",
+        "fields": [],
+    },
+}
+
+
+def attestation_template(category: str) -> dict:
+    """The schema a signer must satisfy for this finding category."""
+    return ATTESTATION_TEMPLATES.get(category, ATTESTATION_TEMPLATES["DEFAULT"])

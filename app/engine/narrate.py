@@ -352,6 +352,7 @@ def narrate(recon: dict, mode: str = "strict") -> dict:
 
     return {
         "stage": "narrate",
+        "engine_version": config.ENGINE_VERSION,
         "mode": mode,
         "mode_label": MODE_LABELS[mode],
         "generated_by": "close-engine narrator v1 (fact-constrained)",

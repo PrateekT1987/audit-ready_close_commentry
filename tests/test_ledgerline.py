@@ -517,9 +517,26 @@ def test_drift_is_blocked() -> None:
 
 
 # ----------------------------------------------------------- sign-off
+def _attestation_for(finding: dict) -> dict:
+    """A template-complete attestation for one warning."""
+    details = {
+        "remediation_owner": "R. Tan, APAC Controller",
+        "remediation_date": "2026-12-31",
+    }
+    if finding["category"] == "CONTROL_BREAK":
+        details["control_id"] = finding["control_id"]
+    if finding["category"] == "DRIVER_UNDISCLOSED":
+        details["reviewed_by"] = "Group FP&A lead"
+    return {
+        "finding_id": finding["finding_id"],
+        "rationale": "Accepted as immaterial; cleared after cut-off.",
+        "details": details,
+    }
+
+
 def _attestations(verification: dict) -> list[dict]:
     return [
-        {"finding_id": f["finding_id"], "rationale": "Accepted as immaterial; cleared after cut-off."}
+        _attestation_for(f)
         for f in verification["findings"]
         if f["severity"] == "warn"
     ]
@@ -670,6 +687,9 @@ def test_legacy_signoff_without_sequence_still_verifies() -> None:
     # Records from before separation of duties also predate the preparer fields.
     legacy.pop("preparer", None)
     legacy.pop("dual_control", None)
+    # ...and predate the engine/verifier version stamps.
+    legacy.pop("engine_version", None)
+    legacy.pop("verifier_version", None)
     legacy["chain_hash"] = audit.digest({
         "prev": legacy["prev_chain_hash"],
         "run_id": legacy["run_id"],
@@ -756,11 +776,164 @@ def test_evidence_pack_manifest_matches_signature() -> None:
         {"id": "run_test"}, RECON, STRICT, VERIFIED, record,
         audit.verify_chain([record], {"run_test": {"payload": {"recon": RECON, "commentary": STRICT, "verification": VERIFIED}}}),
     )
-    assert pack["manifest"]["content_hash"] == record["hashes"]["content_hash"]
-    assert pack["manifest"]["verification_hash"] == record["hashes"]["verification_hash"]
-    assert pack["manifest"]["fact_store_hash"] == record["hashes"]["fact_store_hash"]
-    assert pack["signoff"]["signoff_id"] == "SO-0001"
+    for key in ("content_hash", "verification_hash", "fact_store_hash", "chain_hash"):
+        assert pack["manifest"][key] == record["hashes"].get(key) or pack["manifest"][key] == record.get(key)
+    assert pack["manifest"]["signoff_id"] == record["signoff_id"]
+    assert pack["manifest"]["signed"] is True
+    assert pack["pack_id"] == pack["manifest"]["pack_id"]
+    assert audit.verify_pack_hash(pack)
     assert pack["engagement"]["group"] == "Acme Global Holdings"
+    assert pack["engagement"]["engine_version"] == config.ENGINE_VERSION
+    assert pack["engagement"]["verifier_version"] == config.VERIFIER_VERSION
+
+
+def test_evidence_pack_id_is_stable_and_hash_is_recomputable() -> None:
+    record = _sign()
+    runs = {"run_test": {"payload": {"recon": RECON, "commentary": STRICT, "verification": VERIFIED}}}
+    chain = audit.verify_chain([record], runs)
+    first = audit.evidence_pack({"id": "run_test"}, RECON, STRICT, VERIFIED, record, chain)
+    second = audit.evidence_pack({"id": "run_test"}, RECON, STRICT, VERIFIED, record, chain)
+
+    # The identity of the evidence does not move between downloads.
+    assert first["pack_id"] == second["pack_id"]
+    assert first["manifest"]["pack_id"] == first["pack_id"]
+    # Each download carries its own digest, and that digest verifies.
+    assert audit.verify_pack_hash(first)
+    assert audit.verify_pack_hash(second)
+    tampered = json.loads(json.dumps(first))
+    tampered["variances"][0]["variance_usd"] = "0.01"
+    assert audit.verify_pack_hash(tampered) is False
+
+    # An unsigned pack also has a stable id derived from the live artefact hashes.
+    unsigned_a = audit.evidence_pack({"id": "run_test"}, RECON, STRICT, VERIFIED, None, [])
+    unsigned_b = audit.evidence_pack({"id": "run_test"}, RECON, STRICT, VERIFIED, None, [])
+    assert unsigned_a["pack_id"] == unsigned_b["pack_id"]
+    assert unsigned_a["manifest"]["signed"] is False
+
+
+def test_version_stamps_reach_recon_verification_and_signoff() -> None:
+    assert RECON["engine_version"] == config.ENGINE_VERSION
+    assert STRICT["engine_version"] == config.ENGINE_VERSION
+    assert VERIFIED["engine_version"] == config.ENGINE_VERSION
+    assert VERIFIED["verifier_version"] == config.VERIFIER_VERSION
+
+    record = _sign()
+    assert record["engine_version"] == config.ENGINE_VERSION
+    assert record["verifier_version"] == config.VERIFIER_VERSION
+    # Versions are part of the chain payload, so a change is visible.
+    payload = audit._chain_payload(record)
+    assert payload["engine_version"] == config.ENGINE_VERSION
+    assert payload["verifier_version"] == config.VERIFIER_VERSION
+    assert record["chain_hash"] == audit.digest(payload)
+
+
+def test_control_break_attestation_requires_remediation_details() -> None:
+    warning = next(f for f in VERIFIED["findings"] if f["category"] == "CONTROL_BREAK")
+    prose_only = {"finding_id": warning["finding_id"], "rationale": "Accepted."}
+    try:
+        audit.sign(
+            {"id": "run_test"}, RECON, STRICT, VERIFIED,
+            signer="A. Mensah", role="Group Controller", note="",
+            attestations=[prose_only], prev_chain_hash="genesis", sequence=1,
+            preparer="J. Okafor",
+        )
+    except audit.SignOffRefused as exc:
+        assert "Control reference" in str(exc) or "Remediation" in str(exc)
+    else:
+        raise AssertionError("a prose-only control-break attestation was accepted")
+
+    # The control reference must be the one the finding raised, not a guess.
+    wrong = copy.deepcopy(_attestation_for(warning))
+    wrong["details"]["control_id"] = "TB-OTHER"
+    try:
+        audit.sign(
+            {"id": "run_test"}, RECON, STRICT, VERIFIED,
+            signer="A. Mensah", role="Group Controller", note="",
+            attestations=[wrong], prev_chain_hash="genesis", sequence=1,
+            preparer="J. Okafor",
+        )
+    except audit.SignOffRefused as exc:
+        assert "Control reference" in str(exc)
+    else:
+        raise AssertionError("a mismatched control reference was accepted")
+
+    record = _sign()
+    structured = next(a for a in record["attestations"] if a["category"] == "CONTROL_BREAK")
+    assert structured["template"] == config.ATTESTATION_TEMPLATES["CONTROL_BREAK"]["label"]
+    assert structured["control_id"] == warning["control_id"]
+    assert structured["remediation_owner"]
+    assert structured["remediation_date"] == "2026-12-31"
+    assert structured["details"]["control_id"] == warning["control_id"]
+
+
+def test_diff_reports_changes_and_invalidates_a_signature() -> None:
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    base = client.post("/api/runs", json={"mode": "strict", "prepared_by": "J. Okafor"}).json()
+    base_id = base["run"]["id"]
+    signed = client.post(f"/api/runs/{base_id}/signoff", json={
+        "signer": "A. Mensah", "attestations": _attestations(base["verification"]),
+    })
+    assert signed.status_code == 201, signed.text
+
+    # A clean re-run of the same period: identical artefacts, signature intact.
+    same = client.post("/api/runs", json={"mode": "strict", "prepared_by": "J. Okafor"}).json()
+    same_diff = client.get(f"/api/runs/{base_id}/diff/{same['run']['id']}").json()
+    assert same_diff["same_period"] is True
+    assert same_diff["summary"]["facts_changed"] == 0
+    assert same_diff["summary"]["findings_added"] == 0
+    assert same_diff["summary"]["sections_changed"] == 0
+    assert same_diff["hashes"]["match"] is True
+    assert same_diff["signoffs"]["invalidated"] is False
+    assert same_diff["versions"]["engine_changed"] is False
+    assert same_diff["versions"]["verifier_changed"] is False
+
+    # An adversarial re-narration changes the figures and raises findings.
+    drift = client.post("/api/runs", json={"mode": "drift", "prepared_by": "J. Okafor"}).json()
+    diff = client.get(f"/api/runs/{base_id}/diff/{drift['run']['id']}").json()
+    assert diff["summary"]["sections_changed"] >= 1
+    assert diff["summary"]["findings_added"] >= 3
+    assert any(f["category"] == "UNSOURCED_FIGURE" for f in diff["findings"]["added"])
+    assert diff["hashes"]["match"] is False
+    assert diff["signoffs"]["invalidated"] is True
+    assert "base signature does not cover" in diff["signoffs"]["reason"]
+    assert diff["base"]["signoff_id"] == signed.json()["signoff"]["signoff_id"]
+
+    # Every reported figure change carries both values and a delta.
+    changed_sections = diff["sections"]["changed"]
+    assert all(set(s["reasons"]) for s in changed_sections)
+
+
+def test_rollforward_pivots_four_periods_with_the_current_last() -> None:
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    pivot = client.get("/api/rollforward").json()
+    assert pivot["periods"] == config.PERIODS
+    assert pivot["periods"][-1] == pivot["current_period"]
+    assert pivot["stats"]["periods"] == 4
+
+    group_revenue = next(
+        row for row in pivot["rows"] if row["entity"] == "GRP" and row["account"] == "4000"
+    )
+    for period in config.PERIODS:
+        cell = group_revenue["periods"][period]
+        variance = Decimal(cell["actual_usd"]) - Decimal(cell["budget_usd"])
+        assert variance == Decimal(cell["variance_usd"])
+
+    # Group materiality is recomputed at group level, not inherited from entities.
+    group_rows = [r for r in pivot["rows"] if r["group"]]
+    entity_rows = [r for r in pivot["rows"] if not r["group"]]
+    assert group_rows and entity_rows
+    assert all(len(r["periods"]) >= 3 for r in group_rows)
+
+    filtered = client.get("/api/rollforward", params={"entity": "US01", "statement": "PL"}).json()
+    assert {r["entity"] for r in filtered["rows"]} == {"US01"}
+    assert {r["statement"] for r in filtered["rows"]} == {"PL"}
+    assert filtered["filter"]["entity"] == "US01"
 
 
 # ------------------------------------------------------------- HTTP API
@@ -799,7 +972,7 @@ def test_http_pipeline() -> None:
         "signer": "A. Mensah",
         "role": "Group Controller",
         "note": "Reviewed with the CFO.",
-        "attestations": [{"finding_id": fid, "rationale": "Immaterial; cleared after cut-off."} for fid in warn_ids],
+        "attestations": _attestations(view["verification"]),
     })
     assert signed.status_code == 201, signed.text
     signed_view = signed.json()
@@ -817,8 +990,18 @@ def test_http_pipeline() -> None:
     exported = client.get(f"/api/runs/{run_id}/export")
     assert exported.status_code == 200
     pack = exported.json()
-    assert pack["manifest"] == signed_view["signoff"]["hashes"]
+    assert pack["manifest"]["content_hash"] == signed_view["signoff"]["hashes"]["content_hash"]
+    assert pack["manifest"]["verification_hash"] == signed_view["signoff"]["hashes"]["verification_hash"]
+    assert pack["manifest"]["fact_store_hash"] == signed_view["signoff"]["hashes"]["fact_store_hash"]
+    assert pack["manifest"]["signoff_id"] == signed_view["signoff"]["signoff_id"]
+    assert pack["pack_id"] == pack["manifest"]["pack_id"]
+    assert audit.verify_pack_hash(pack)
     assert pack["chain"][-1]["status"] == "intact"
+
+    # The stable id survives a second download; the per-download digest still verifies.
+    again = client.get(f"/api/runs/{run_id}/export").json()
+    assert again["pack_id"] == pack["pack_id"]
+    assert audit.verify_pack_hash(again)
 
     csv = client.get(f"/api/runs/{run_id}/export.csv")
     assert csv.status_code == 200
@@ -846,7 +1029,7 @@ def test_http_separation_of_duties() -> None:
     assert view["run"]["dual_control"] is False
     assert view["verification"]["gate"]["blocking"] == 0
     warn_ids = [f["finding_id"] for f in view["verification"]["findings"] if f["severity"] == "warn"]
-    attestations = [{"finding_id": fid, "rationale": "Immaterial; cleared after cut-off."} for fid in warn_ids]
+    attestations = _attestations(view["verification"])
 
     refused = client.post(f"/api/runs/{run_id}/signoff", json={
         "signer": "p. raghavan", "attestations": attestations,
@@ -869,10 +1052,7 @@ def test_http_separation_of_duties() -> None:
         "mode": "strict", "prepared_by": "P. Raghavan", "dual_control": True,
     }).json()
     dual_id = dual["run"]["id"]
-    dual_attest = [
-        {"finding_id": f["finding_id"], "rationale": "Immaterial; cleared after cut-off."}
-        for f in dual["verification"]["findings"] if f["severity"] == "warn"
-    ]
+    dual_attest = _attestations(dual["verification"])
     dual_signed = client.post(f"/api/runs/{dual_id}/signoff", json={
         "signer": "P. Raghavan", "attestations": dual_attest,
     })

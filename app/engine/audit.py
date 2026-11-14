@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
+
+from app import config
 
 
 class SignOffRefused(Exception):
@@ -64,7 +66,7 @@ def _chain_payload(record: dict) -> dict:
         "signer": record["signer"],
         "signed_at": record["signed_at"],
     }
-    for key in ("sequence", "preparer", "dual_control"):
+    for key in ("sequence", "preparer", "dual_control", "engine_version", "verifier_version"):
         if key in record:
             payload[key] = record[key]
     return payload
@@ -80,12 +82,20 @@ def _variance_core(recon: dict) -> list[dict]:
 
 
 def hashes(recon: dict, commentary: dict, verification: dict) -> dict:
-    content = digest({
+    content_payload = {
         "period": recon["period"],
         "policy": recon["policy"],
         "variances": _variance_core(recon),
         "sections": commentary["sections"],
-    })
+    }
+    # Version stamps are committed for new runs. Runs signed before they
+    # existed carry neither key, and their hashes still recompute unchanged.
+    for key in ("engine_version",):
+        if recon.get(key):
+            content_payload[f"recon_{key}"] = recon[key]
+        if commentary.get(key):
+            content_payload[f"commentary_{key}"] = commentary[key]
+    content = digest(content_payload)
     verification_payload = {
         "status": verification["status"],
         "findings": verification["findings"],
@@ -98,6 +108,8 @@ def hashes(recon: dict, commentary: dict, verification: dict) -> dict:
     # before this check existed carry no such key, and their hashes still verify.
     if verification.get("cross_section") is not None:
         verification_payload["cross_section"] = verification["cross_section"]
+    if verification.get("verifier_version"):
+        verification_payload["verifier_version"] = verification["verifier_version"]
     verification_hash = digest(verification_payload)
     # The fact-store hash commits to each fact's *full* provenance, not just its
     # value: derivation lines (journal ids and amounts), FX rate, opening period,
@@ -112,13 +124,78 @@ def hashes(recon: dict, commentary: dict, verification: dict) -> dict:
     }
 
 
+def _attestation_details(attestation: dict) -> dict[str, str]:
+    """Structured fields supplied by the signer, from either shape the API accepts."""
+    details: dict[str, str] = {}
+    for key, value in (attestation.get("details") or {}).items():
+        text = str(value).strip() if value is not None else ""
+        if text:
+            details[str(key)] = text
+    # Older clients send the well-known fields at the top level.
+    for key in ("control_id", "remediation_owner", "remediation_date", "reviewed_by"):
+        value = attestation.get(key)
+        text = str(value).strip() if value is not None else ""
+        if text:
+            details.setdefault(key, text)
+    return details
+
+
+def _validate_attestation(warning: dict, attestation: dict) -> tuple[dict, dict[str, str], list[str]]:
+    """Check one warning's attestation against its category template."""
+    template = config.attestation_template(warning["category"])
+    details = _attestation_details(attestation)
+    problems: list[str] = []
+    for field in template["fields"]:
+        if not field.get("required"):
+            continue
+        name = field["name"]
+        value = details.get(name, "")
+        auto = field.get("auto_from_finding")
+        if auto:
+            expected = str(warning.get(auto) or "").strip()
+            if expected and value and value != expected:
+                problems.append(f"{field['label']} must be {expected} for this finding, not {value}")
+                continue
+            if not value and expected:
+                value = expected
+                details[name] = expected
+        if not value:
+            problems.append(f"{field['label']} is required")
+            continue
+        if field.get("type") == "date":
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                problems.append(f"{field['label']} must be an ISO date (YYYY-MM-DD)")
+    return template, details, problems
+
+
 def preflight(recon: dict, verification: dict, attestations: list[dict]) -> dict:
     """Everything that must be true before a signature is accepted."""
     gate = verification["gate"]
     blocks = [f for f in verification["findings"] if f["severity"] == "block"]
     warns = [f for f in verification["findings"] if f["severity"] == "warn"]
-    attested = {a.get("finding_id"): (a.get("rationale") or "").strip() for a in attestations}
-    unattested = [w["finding_id"] for w in warns if not attested.get(w["finding_id"])]
+    supplied = {a.get("finding_id"): a for a in attestations}
+    attested = {
+        finding_id: a for finding_id, a in supplied.items()
+        if (a.get("rationale") or "").strip()
+    }
+    unattested: list[str] = []
+    attestation_issues: list[dict] = []
+    for warning in warns:
+        attestation = attested.get(warning["finding_id"])
+        if attestation is None:
+            unattested.append(warning["finding_id"])
+            continue
+        template, _, problems = _validate_attestation(warning, attestation)
+        if problems:
+            unattested.append(warning["finding_id"])
+            attestation_issues.append({
+                "finding_id": warning["finding_id"],
+                "category": warning["category"],
+                "template": template["label"],
+                "problems": problems,
+            })
 
     checks = [
         {
@@ -173,7 +250,7 @@ def preflight(recon: dict, verification: dict, attestations: list[dict]) -> dict
         },
         {
             "id": "attestations",
-            "label": "Every warning has been attested by the signer",
+            "label": "Every warning is attested with its category's required detail",
             "passed": not unattested,
             "detail": f"{len(warns) - len(unattested)} of {len(warns)} attested" if warns else "no warnings open",
         },
@@ -183,6 +260,7 @@ def preflight(recon: dict, verification: dict, attestations: list[dict]) -> dict
         "permitted": permitted,
         "checks": checks,
         "unattested": unattested,
+        "attestation_issues": attestation_issues,
         "gate_status": gate["status"],
         "blocking_findings": blocks,
         "warnings": warns,
@@ -218,10 +296,34 @@ def sign(
     state = preflight(recon, verification, attestations)
     if not state["permitted"]:
         failed = [c["label"] for c in state["checks"] if not c["passed"]]
-        raise SignOffRefused("Sign-off is not permitted: " + "; ".join(failed))
+        message = "Sign-off is not permitted: " + "; ".join(failed)
+        if state.get("attestation_issues"):
+            detail = "; ".join(
+                f"{issue['finding_id']} ({issue['category']}): {', '.join(issue['problems'])}"
+                for issue in state["attestation_issues"]
+            )
+            message += f". Attestation detail required: {detail}"
+        raise SignOffRefused(message)
 
     signed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     artefact_hashes = hashes(recon, commentary, verification)
+    supplied = {a.get("finding_id"): a for a in attestations}
+    witnessed: list[dict] = []
+    for warning in state["warnings"]:
+        attestation = supplied[warning["finding_id"]]
+        template, details, _ = _validate_attestation(warning, attestation)
+        entry = {
+            "finding_id": warning["finding_id"],
+            "category": warning["category"],
+            "template": template["label"],
+            "rationale": attestation["rationale"].strip(),
+            "details": details,
+        }
+        for key in ("control_id", "remediation_owner", "remediation_date", "reviewed_by"):
+            if details.get(key):
+                entry[key] = details[key]
+        witnessed.append(entry)
+
     record = {
         "signoff_id": f"SO-{sequence:04d}",
         "sequence": sequence,
@@ -233,14 +335,9 @@ def sign(
         "role": role.strip() or "Controller",
         "signed_at": signed_at,
         "note": note.strip(),
-        "attestations": [
-            {
-                "finding_id": a["finding_id"],
-                "rationale": a["rationale"].strip(),
-            }
-            for a in attestations
-            if (a.get("rationale") or "").strip()
-        ],
+        "engine_version": recon.get("engine_version") or config.ENGINE_VERSION,
+        "verifier_version": verification.get("verifier_version") or config.VERIFIER_VERSION,
+        "attestations": witnessed,
         "counts": {
             "material_variances": len([v for v in recon["variances"] if v["material"]]),
             "figures_verified": verification["stats"]["figures_checked"],
@@ -307,9 +404,50 @@ def verify_chain(signoffs: list[dict], runs: dict[str, dict] | None = None) -> l
     return results
 
 
+def pack_id_for(run: dict, recon: dict, commentary: dict, verification: dict, signoff: dict | None) -> str:
+    """A stable identifier for the evidence in a run.
+
+    Unlike `generated_at` and the current chain snapshot, this value does not
+    move between downloads, so two packs of the same run can be shown to
+    describe the same signed artefacts.
+    """
+    if signoff is not None:
+        material = {
+            "run_id": run["id"],
+            "signoff_id": signoff.get("signoff_id"),
+            "sequence": signoff.get("sequence"),
+            "hashes": signoff.get("hashes"),
+            "chain_hash": signoff.get("chain_hash"),
+        }
+    else:
+        material = {
+            "run_id": run["id"],
+            "period": recon["period"],
+            "status": verification["status"],
+            "hashes": hashes(recon, commentary, verification),
+        }
+    return digest({
+        "kind": "ledgerline.evidence_pack",
+        "pack_version": config.EVIDENCE_PACK_VERSION,
+        **material,
+    })
+
+
+def _pack_hash(pack: dict) -> str:
+    """Hash of the pack as downloaded, excluding the hash itself."""
+    return digest({key: value for key, value in pack.items() if key != "pack_hash"})
+
+
+def verify_pack_hash(pack: dict) -> bool:
+    """True when the downloaded bytes still match the pack's own digest."""
+    return bool(pack.get("pack_hash")) and _pack_hash(pack) == pack["pack_hash"]
+
+
 def evidence_pack(run: dict, recon: dict, commentary: dict, verification: dict, signoff: dict | None, chain: list[dict]) -> dict:
-    return {
-        "pack_version": "1.0",
+    pack_id = pack_id_for(run, recon, commentary, verification, signoff)
+    pack = {
+        "pack_version": config.EVIDENCE_PACK_VERSION,
+        "pack_id": pack_id,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "engagement": {
             "group": "Acme Global Holdings",
@@ -318,6 +456,8 @@ def evidence_pack(run: dict, recon: dict, commentary: dict, verification: dict, 
             "group_currency": recon["group_currency"],
             "run_id": run["id"],
             "narrative_mode": commentary["mode"],
+            "engine_version": recon.get("engine_version") or config.ENGINE_VERSION,
+            "verifier_version": verification.get("verifier_version") or config.VERIFIER_VERSION,
         },
         "materiality_policy": recon["policy"],
         "sources": {
@@ -339,6 +479,8 @@ def evidence_pack(run: dict, recon: dict, commentary: dict, verification: dict, 
             "closure": verification["closure"],
             "cross_section": verification.get("cross_section"),
             "self_test": verification["self_test"],
+            "engine_version": verification.get("engine_version") or config.ENGINE_VERSION,
+            "verifier_version": verification.get("verifier_version") or config.VERIFIER_VERSION,
         },
         "controls": {
             "integrity": recon["integrity"],
@@ -348,12 +490,22 @@ def evidence_pack(run: dict, recon: dict, commentary: dict, verification: dict, 
         "signoff": signoff,
         "chain": chain,
         "manifest": {
+            "pack_id": pack_id,
+            "pack_version": config.EVIDENCE_PACK_VERSION,
+            "signed": signoff is not None,
+            "hash_rule": "sha256 of this pack as downloaded, with pack_hash removed",
+            "engine_version": recon.get("engine_version") or config.ENGINE_VERSION,
+            "verifier_version": verification.get("verifier_version") or config.VERIFIER_VERSION,
             "content_hash": (signoff or {}).get("hashes", {}).get("content_hash"),
             "verification_hash": (signoff or {}).get("hashes", {}).get("verification_hash"),
             "fact_store_hash": (signoff or {}).get("hashes", {}).get("fact_store_hash"),
+            "signoff_id": (signoff or {}).get("signoff_id"),
+            "chain_hash": (signoff or {}).get("chain_hash"),
         },
         "note": "Figure values are stored as decimal strings to preserve exactness. Every fact carries listed derivation information sufficient to recompute it from the journal extract.",
     }
+    pack["pack_hash"] = _pack_hash(pack)
+    return pack
 
 
 def commentary_csv(recon: dict, commentary: dict) -> str:

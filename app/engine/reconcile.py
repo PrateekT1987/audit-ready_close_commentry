@@ -837,6 +837,7 @@ def reconcile(dataset: dict) -> dict:
 
     return {
         "stage": "reconcile",
+        "engine_version": config.ENGINE_VERSION,
         "period": period,
         "prior_period": prior_period,
         "group_currency": US,

@@ -4,9 +4,13 @@
 const S = {
   meta: null,
   run: null,
+  runs: [],
   tab: "overview",
   loading: true,
-  wb: { entity: "ALL", statement: "ALL", materialOnly: false, q: "", open: null },
+  wb: { entity: "ALL", statement: "ALL", materialOnly: false, q: "", open: null, mode: "variance" },
+  rollforward: null,
+  rollforwardLoading: false,
+  diff: { base: null, compare: null, data: null, loading: false, attempted: false },
   verifyFilter: "all",
   claimFilter: "all",
   factCache: {},
@@ -122,9 +126,11 @@ async function boot() {
   try {
     S.meta = await api("/api/meta");
     const runs = await api("/api/runs");
+    S.runs = runs.runs;
     let view;
     if (!runs.runs.length) {
       view = await api("/api/runs", { method: "POST", body: JSON.stringify({ mode: "strict" }) });
+      S.runs = (await api("/api/runs")).runs;
     } else {
       view = await api(`/api/runs/${runs.runs[0].id}`);
     }
@@ -132,6 +138,49 @@ async function boot() {
   } catch (error) {
     $("#main").innerHTML = `<div class="banner banner-block"><span class="banner-icon">!</span><div><strong>Could not start the close.</strong><br />${esc(error.message)}</div></div>`;
   }
+}
+
+async function refreshRuns() {
+  try {
+    S.runs = (await api("/api/runs")).runs;
+  } catch {
+    /* the run picker is a convenience; a failed refresh must not break the view */
+  }
+}
+
+function templateFor(category) {
+  const templates = S.meta?.attestation_templates || {};
+  return templates[category] || templates.DEFAULT || { label: "Exception attestation", instruction: "", fields: [] };
+}
+
+function attestationDetails(finding) {
+  const state = S.attest[finding.finding_id] || {};
+  const details = { ...(state.details || {}) };
+  for (const field of templateFor(finding.category).fields || []) {
+    if (field.auto_from_finding && !details[field.name]) {
+      details[field.name] = String(finding[field.auto_from_finding] || "");
+    }
+  }
+  return details;
+}
+
+function attestationProblems(finding) {
+  const state = S.attest[finding.finding_id] || {};
+  const problems = [];
+  if (!state.checked) problems.push("not accepted");
+  if (!(state.rationale || "").trim()) problems.push("rationale required");
+  const details = attestationDetails(finding);
+  for (const field of templateFor(finding.category).fields || []) {
+    if (!field.required) continue;
+    const value = String(details[field.name] || "").trim();
+    if (!value) problems.push(`${field.label} required`);
+    else if (field.type === "date" && !/^\d{4}-\d{2}-\d{2}$/.test(value)) problems.push(`${field.label} must be a date`);
+  }
+  return problems;
+}
+
+function attestationReady(finding) {
+  return attestationProblems(finding).length === 0;
 }
 
 function applyView(view) {
@@ -144,7 +193,11 @@ function applyView(view) {
   }
   S.attest = {};
   (view.verification.findings || []).filter((f) => f.severity === "warn").forEach((f) => {
-    S.attest[f.finding_id] = { checked: false, rationale: "" };
+    const details = {};
+    for (const field of templateFor(f.category).fields || []) {
+      if (field.auto_from_finding) details[field.name] = String(f[field.auto_from_finding] || "");
+    }
+    S.attest[f.finding_id] = { checked: false, rationale: "", details };
   });
   bindFigStatus();
   render();
@@ -160,7 +213,7 @@ function bindFigStatus() {
 }
 
 /* ------------------------------------------------------------------ render */
-const TABS = new Set(["overview", "workbench", "commentary", "verify", "signoff"]);
+const TABS = new Set(["overview", "workbench", "commentary", "verify", "signoff", "compare"]);
 function tabFromHash() {
   const value = (window.location.hash || "").replace(/^#\/?/, "");
   return TABS.has(value) ? value : null;
@@ -172,15 +225,37 @@ function render() {
   renderTopbar();
   renderRail();
   renderMain();
+  // Opening the comparison tab directly (nav, hash, boot) should fetch rather
+  // than sit on a spinner. `attempted` makes this a one-shot: a failed load
+  // renders its own message instead of retrying on every paint.
+  if (
+    S.tab === "compare" &&
+    !S.diff.data &&
+    !S.diff.loading &&
+    !S.diff.attempted &&
+    S.runs.length >= 2
+  ) {
+    openDiff();
+  }
 }
 
 function renderTopbar() {
   const { run, recon } = S.run;
+  const runs = S.runs.length ? S.runs : [{ id: run.id, period: run.period, mode: run.mode, status: run.status, label: run.label }];
+  const runOptions = runs.map((r) => {
+    const stamp = (r.created_at || "").slice(11, 16);
+    const text = `${r.period || ""} · ${r.mode || ""} · ${r.status || ""}${stamp ? ` · ${stamp}` : ""} · ${(r.id || "").slice(-4)}`;
+    return `<option value="${esc(r.id)}" ${r.id === run.id ? "selected" : ""}>${esc(text)}</option>`;
+  }).join("");
   $("#topbar-context").innerHTML = `
     <span class="chip"><span class="mono">${esc(run.period_label)}</span></span>
     <span class="chip">${esc(S.meta.group)}</span>
     <span class="chip chip-quiet">${esc(recon.stats.entities)} entities · ${esc(recon.stats.journal_lines)} journal lines · ${esc(recon.stats.facts)} figures</span>
     ${statusPill(run.status)}
+    <span class="run-switch">
+      <select id="run-switcher" aria-label="Select a close run">${runOptions}</select>
+      <button class="btn btn-sm btn-ghost" data-act="open-diff" ${runs.length < 2 ? "disabled" : ""}>Compare runs</button>
+    </span>
   `;
   $("#export-btn").disabled = false;
 }
@@ -217,6 +292,7 @@ function renderRail() {
     ["commentary", "Commentary", S.run.commentary.stats.sections],
     ["verify", "Verification", verification.gate.blocking || null],
     ["signoff", "Sign-off & audit", null],
+    ["compare", "Run comparison", null],
   ];
 
   $("#rail").innerHTML = `
@@ -259,7 +335,7 @@ function renderRail() {
 
 function renderMain() {
   const main = $("#main");
-  const renderers = { overview: renderOverview, workbench: renderWorkbench, commentary: renderCommentary, verify: renderVerify, signoff: renderSignoff };
+  const renderers = { overview: renderOverview, workbench: renderWorkbench, commentary: renderCommentary, verify: renderVerify, signoff: renderSignoff, compare: renderCompare };
   main.innerHTML = renderers[S.tab]();
   if (S.tab === "commentary" && S.section) {
     const node = document.getElementById(`sec-${S.section}`);
@@ -470,7 +546,15 @@ function controlSummary(integrity) {
 }
 
 /* ------------------------------------------------------------- workbench */
+function modeToggle() {
+  return `<div class="mode-toggle">
+    <button class="${S.wb.mode === "variance" ? "on" : ""}" data-act="wb-mode" data-mode="variance">Current period</button>
+    <button class="${S.wb.mode === "rollforward" ? "on" : ""}" data-act="wb-mode" data-mode="rollforward">Roll-forward Jul–Oct</button>
+  </div>`;
+}
+
 function renderWorkbench() {
+  if (S.wb.mode === "rollforward") return renderRollforward();
   const { recon } = S.run;
   const entities = [...new Set(recon.variances.map((v) => v.entity))].sort();
   const rows = recon.variances.filter((v) => {
@@ -509,6 +593,7 @@ function renderWorkbench() {
         <div class="page-sub">${recon.variances.length} account variances across ${recon.stats.entities} entities · ${recon.stats.material_variances} clear the materiality policy · click a row to see the attribution.</div>
       </div>
       <div class="page-actions">
+        ${modeToggle()}
         <span class="chip chip-quiet">Policy: ${money(S.meta.materiality.PL.amount_usd)} & ${pct(S.meta.materiality.PL.min_pct)} (P&L)</span>
       </div>
     </div>
@@ -538,6 +623,115 @@ function renderWorkbench() {
       <div class="card-ft"><span>${rows.length} of ${recon.variances.length} rows</span><span>Figures in ${esc(recon.group_currency)}, translated at month-end closing rates</span></div>
     </div>
   `;
+}
+
+function renderRollforward() {
+  const data = S.rollforward;
+  const head = `
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">Roll-forward</h1>
+        <div class="page-sub">${esc(S.meta.group)} · period × account · ${data ? `${data.periods.length} periods, current period on the right` : "loading the quarter"}.</div>
+      </div>
+      <div class="page-actions">
+        ${modeToggle()}
+        <button class="btn btn-sm btn-ghost" data-act="refresh-rollforward" ${S.rollforwardLoading ? "disabled" : ""}>Refresh</button>
+      </div>
+    </div>`;
+
+  if (!data) {
+    return `${head}
+      <div class="loading-card"><div class="spinner"></div><p>Reconciling July through October…</p></div>`;
+  }
+
+  const entities = ["ALL", ...data.entities.map((e) => e.code)];
+  const query = S.wb.q.trim().toLowerCase();
+  const rows = data.rows.filter((row) => {
+    if (S.wb.entity !== "ALL" && row.entity !== S.wb.entity) return false;
+    if (S.wb.statement !== "ALL" && row.statement !== S.wb.statement) return false;
+    if (S.wb.materialOnly && !(row.material_periods || []).length) return false;
+    if (query) {
+      const hay = `${row.account} ${row.account_name} ${row.account_short} ${row.entity} ${row.entity_name}`.toLowerCase();
+      if (!hay.includes(query)) return false;
+    }
+    return true;
+  });
+
+  const cell = (row, period) => {
+    const value = row.periods[period];
+    if (!value) return `<td class="rf-cell rf-empty">—</td>`;
+    const variance = num(value.variance_usd);
+    return `<td class="rf-cell ${period === data.current_period ? "rf-current" : ""}">
+      <div class="rf-actual">${money(value.actual_usd)}</div>
+      <div class="rf-var ${variance < 0 ? "neg" : "pos"}">${money(variance, { signed: true })}</div>
+      ${value.material ? `<span class="tag tag-accent xsmall">material</span>` : ""}
+    </td>`;
+  };
+
+  const body = rows.map((row) => `
+    <tr class="${row.group ? "rf-group" : ""}">
+      <td class="mono nowrap">${esc(row.entity)}</td>
+      <td><span class="mono small">${esc(row.account)}</span> ${esc(row.account_name)}
+        <span class="tag tag-line xsmall">${esc(row.statement)}</span></td>
+      ${data.periods.map((period) => cell(row, period)).join("")}
+    </tr>`).join("");
+
+  const wanted = ["revenue_total", "gross_profit", "ebitda", "net_income"];
+  const aggregateRows = wanted.map((id) => {
+    const label = data.aggregates[data.periods[0]]?.find((a) => a.aggregate_id === id)?.label || id;
+    return `<tr>
+      <td>${esc(label)}</td>
+      ${data.periods.map((period) => {
+        const agg = (data.aggregates[period] || []).find((a) => a.aggregate_id === id);
+        return `<td class="rf-cell ${period === data.current_period ? "rf-current" : ""}">
+          <div class="rf-actual">${agg ? money(agg.value_usd.actual) : "—"}</div>
+          <div class="rf-var ${agg && num(agg.value_usd.variance) < 0 ? "neg" : "pos"}">${agg ? money(agg.value_usd.variance, { signed: true }) : ""}</div>
+        </td>`;
+      }).join("")}
+    </tr>`;
+  }).join("");
+
+  return `${head}
+    <div class="card">
+      <div class="card-hd" style="gap:10px">
+        <div class="row" style="gap:8px">
+          <select id="wb-entity" style="width:auto">${entities.map((e) => `<option value="${e}" ${S.wb.entity === e ? "selected" : ""}>${e === "ALL" ? "All entities (group + entities)" : e}</option>`).join("")}</select>
+          <select id="wb-statement" style="width:auto">
+            ${[["ALL", "All statements"], ["PL", "Profit & loss"], ["BS", "Balance sheet"]].map(([v, l]) => `<option value="${v}" ${S.wb.statement === v ? "selected" : ""}>${l}</option>`).join("")}
+          </select>
+          <label class="row" style="gap:6px;font-size:12px;color:var(--muted)"><input type="checkbox" id="wb-material" ${S.wb.materialOnly ? "checked" : ""} style="accent-color:#0b5f6b" /> material in any period</label>
+        </div>
+        <input type="text" id="wb-search" placeholder="Search account…" value="${esc(S.wb.q)}" style="width:220px" />
+      </div>
+      <div class="card-bd tight">
+        <div class="tbl-wrap" style="max-height:640px;overflow:auto">
+          <table class="tbl rf-table">
+            <thead><tr>
+              <th>Entity</th><th>Account</th>
+              ${data.periods.map((period) => `<th class="num ${period === data.current_period ? "rf-current" : ""}">${esc(data.period_labels[period] || period)}</th>`).join("")}
+            </tr></thead>
+            <tbody>${body || `<tr><td colspan="${data.periods.length + 2}" class="muted" style="padding:24px;text-align:center">No accounts match the filter.</td></tr>`}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card-ft">
+        <span>${rows.length} of ${data.rows.length} rows · actual above, variance vs budget below · figures in ${esc(data.group_currency)}</span>
+        <span>${data.stats.material_cells} material period cells · group materiality recomputed at group level</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-hd"><h2>Group roll-forward</h2><span class="hd-note">actual above · variance vs budget below</span></div>
+      <div class="card-bd tight">
+        <div class="tbl-wrap">
+          <table class="tbl rf-table">
+            <thead><tr><th>Measure</th>${data.periods.map((period) => `<th class="num ${period === data.current_period ? "rf-current" : ""}">${esc(data.period_labels[period] || period)}</th>`).join("")}</tr></thead>
+            <tbody>${aggregateRows}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card-ft"><span>Current period is highlighted on the right. July has no prior month in the extract, so its prior-period comparator equals the period itself.</span></div>
+    </div>`;
 }
 
 function renderVarianceDetail(v) {
@@ -921,6 +1115,185 @@ function renderVerify() {
 }
 
 /* -------------------------------------------------------------- signoff */
+/* --------------------------------------------------------------- compare */
+function runOption(run, selected) {
+  const stamp = (run.created_at || "").replace("T", " ").slice(0, 16);
+  const text = `${run.period || ""} · ${run.mode || ""} · ${run.status || ""} · ${stamp} · ${(run.id || "").slice(-4)}`;
+  return `<option value="${esc(run.id)}" ${run.id === selected ? "selected" : ""}>${esc(text)}</option>`;
+}
+
+function renderCompare() {
+  const runs = S.runs;
+  const data = S.diff.data;
+  const baseId = S.diff.base || runs[0]?.id;
+  const compareId = S.diff.compare || runs[1]?.id;
+
+  const head = `
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">Run comparison</h1>
+        <div class="page-sub">What changed between two persisted runs: figures, findings, commentary and whether a signature still covers the result.</div>
+      </div>
+    </div>`;
+
+  if (runs.length < 2) {
+    return `${head}
+      <div class="banner banner-warn"><span class="banner-icon">▲</span><div><strong>Two runs are needed to compare.</strong> Run the close again to compare a fresh run against the current one.</div></div>`;
+  }
+
+  const controls = `
+    <div class="card">
+      <div class="card-hd" style="gap:10px">
+        <div class="row" style="gap:8px;align-items:flex-end">
+          <label class="field" style="min-width:220px"><span>Base run (left)</span><select id="diff-base">${runs.map((r) => runOption(r, baseId)).join("")}</select></label>
+          <span class="muted small" style="padding-bottom:9px">vs</span>
+          <label class="field" style="min-width:220px"><span>Comparison run (right)</span><select id="diff-compare">${runs.map((r) => runOption(r, compareId)).join("")}</select></label>
+          <button class="btn btn-sm btn-primary" data-act="load-diff" ${S.diff.loading ? "disabled" : ""}>${S.diff.loading ? "Comparing…" : "Compare"}</button>
+        </div>
+      </div>
+    </div>`;
+
+  if (!data) {
+    if (S.diff.loading || !S.diff.attempted) {
+      return `${head}${controls}
+        <div class="loading-card"><div class="spinner"></div><p>Reviewing the two workpapers…</p></div>`;
+    }
+    return `${head}${controls}
+      <div class="banner banner-warn"><span class="banner-icon">▲</span><div>
+        <strong>No comparison loaded.</strong> The two runs could not be compared. Pick a different pair and select Compare again.
+      </div></div>`;
+  }
+
+  const summary = data.summary;
+  const kpis = [
+    ["Figures changed", summary.facts_changed + summary.facts_added + summary.facts_removed,
+      `${summary.facts_changed} changed · ${summary.facts_added} added · ${summary.facts_removed} removed`,
+      summary.facts_changed || summary.facts_added || summary.facts_removed ? "warn" : "pass"],
+    ["Findings added", summary.findings_added, `${summary.findings_cleared} cleared · ${summary.findings_changed} reworded`,
+      summary.findings_added ? "block" : "pass"],
+    ["Commentary sections changed", summary.sections_changed, `${summary.sections_added} added · ${summary.sections_cleared} cleared`,
+      summary.sections_changed ? "warn" : "pass"],
+    ["Signature invalidated", data.signoffs.invalidated ? "yes" : "no",
+      data.base.signoff_id ? `base ${data.base.signoff_id}` : "base unsigned",
+      data.signoffs.invalidated ? "block" : "pass"],
+    ["Engine / verifier", `${esc(data.compare.engine_version || "—")} / ${esc(data.compare.verifier_version || "—")}`,
+      `base ${data.base.engine_version || "—"} / ${data.base.verifier_version || "—"}`,
+      data.versions.engine_changed || data.versions.verifier_changed ? "warn" : "pass"],
+  ];
+
+  const findingRow = (finding, tone) => `
+    <tr>
+      <td>${sevTag(finding.severity)}</td>
+      <td class="mono small">${esc(finding.category)}</td>
+      <td>${esc(finding.message)}</td>
+      <td class="mono xsmall">${esc(finding.section_id || finding.control_id || finding.fact_id || "")}</td>
+      <td><span class="tag tag-${tone}">${tone === "block" ? "added" : "cleared"}</span></td>
+    </tr>`;
+
+  const findingRows = [
+    ...data.findings.added.map((f) => findingRow(f, f.severity === "block" ? "block" : "warn")),
+    ...data.findings.cleared.map((f) => findingRow(f, "pass")),
+  ].join("");
+
+  const varianceRows = data.variances.map((row) => `
+    <tr>
+      <td class="mono small">${esc(row.entity)}</td>
+      <td>${esc(row.account_short)} <span class="mono xsmall muted">${esc(row.account)}</span></td>
+      <td><span class="tag ${row.change === "changed" ? "tag-warn" : row.change === "added" ? "tag-accent" : "tag-line"}">${esc(row.change)}</span></td>
+      <td>
+        ${row.fields.length ? row.fields.map((f) => `<div class="xsmall"><span class="mono">${esc(f.field)}</span> ${esc(f.base)} → <strong>${esc(f.compare)}</strong>${f.delta ? ` <span class="${num(f.delta) < 0 ? "neg" : "pos"}">(${esc(f.delta)})</span>` : ""}</div>`).join("") : `<span class="muted small">account added or removed</span>`}
+      </td>
+    </tr>`).join("");
+
+  const factRows = data.facts.map((fact) => `
+    <tr>
+      <td class="mono xsmall">${esc(fact.kind)}</td>
+      <td>${esc(fact.label)}<div class="xsmall muted">${esc(fact.entity || "")} ${fact.account ? `· ${esc(fact.account)}` : ""} ${fact.period ? `· ${esc(fact.period)}` : ""}</div></td>
+      <td class="num mono xsmall">${esc(fact.base_value ?? "—")}</td>
+      <td class="num mono xsmall">${esc(fact.compare_value ?? "—")}</td>
+      <td class="num mono xsmall ${fact.delta && num(fact.delta) < 0 ? "neg" : "pos"}">${esc(fact.delta ?? "")}</td>
+    </tr>`).join("");
+
+  const sectionRows = [
+    ...data.sections.changed.map((s) => `<tr><td class="mono small">${esc(s.section_id)}</td><td>${esc(s.title || s.kind)}</td><td>${esc((s.reasons || []).join(", "))}</td><td><span class="tag tag-warn">changed</span></td></tr>`),
+    ...data.sections.added.map((s) => `<tr><td class="mono small">${esc(s.section_id)}</td><td>${esc(s.title || s.kind)}</td><td>new section</td><td><span class="tag tag-accent">added</span></td></tr>`),
+    ...data.sections.cleared.map((s) => `<tr><td class="mono small">${esc(s.section_id)}</td><td>${esc(s.title || s.kind)}</td><td>removed</td><td><span class="tag tag-line">cleared</span></td></tr>`),
+  ].join("");
+
+  return `${head}${controls}
+
+    ${data.same_period ? "" : `<div class="banner banner-warn"><span class="banner-icon">▲</span><div><strong>Different periods.</strong> The two runs cover ${esc(data.base.period)} and ${esc(data.compare.period)}; the comparison is informational.</div></div>`}
+
+    <div class="kpis" style="grid-template-columns:repeat(5,minmax(0,1fr))">
+      ${kpis.map(([label, value, foot, cls]) => `
+        <div class="kpi ${cls}"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${value}</div><div class="kpi-foot">${esc(foot)}</div></div>`).join("")}
+    </div>
+
+    <div class="card">
+      <div class="card-hd"><h2>Signature status</h2><span class="hd-note">${data.hashes.match ? "artefact hashes match" : "artefact hashes differ"}</span></div>
+      <div class="card-bd">
+        <div class="kv-grid">
+          <div class="kv"><dt>Base run</dt><dd>${esc(data.base.run_id)} · ${esc(data.base.status)}${data.base.signoff_id ? ` · ${esc(data.base.signoff_id)}` : " · unsigned"}</dd></div>
+          <div class="kv"><dt>Comparison run</dt><dd>${esc(data.compare.run_id)} · ${esc(data.compare.status)}${data.compare.signoff_id ? ` · ${esc(data.compare.signoff_id)}` : " · unsigned"}</dd></div>
+          <div class="kv"><dt>Base content hash</dt><dd class="hash">${esc(data.hashes.base.content_hash)}</dd></div>
+          <div class="kv"><dt>Compare content hash</dt><dd class="hash">${esc(data.hashes.compare.content_hash)}</dd></div>
+        </div>
+        <div class="banner ${data.signoffs.invalidated ? "banner-block" : "banner-pass"}" style="margin-top:12px">
+          <span class="banner-icon">${data.signoffs.invalidated ? "■" : "✓"}</span>
+          <div><strong>${data.signoffs.invalidated ? "Signature does not cover the comparison run." : "No signature is invalidated."}</strong> ${esc(data.signoffs.reason)}${data.signoffs.base.chain_status ? ` Chain link: ${esc(data.signoffs.base.chain_status)}.` : ""}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-hd"><h2>Findings</h2><span class="hd-note">${data.findings.added.length} added · ${data.findings.cleared.length} cleared · ${data.findings.changed.length} reworded</span></div>
+      <div class="card-bd tight">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Severity</th><th>Category</th><th>Message</th><th>Subject</th><th>Change</th></tr></thead>
+            <tbody>${findingRows || `<tr><td colspan="5" class="muted" style="padding:20px;text-align:center">The two verification reports raise the same findings.</td></tr>`}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-hd"><h2>Variances that moved</h2><span class="hd-note">${data.variances.length} changed</span></div>
+      <div class="card-bd tight">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Entity</th><th>Account</th><th>Change</th><th>Fields (base → comparison)</th></tr></thead>
+            <tbody>${varianceRows || `<tr><td colspan="4" class="muted" style="padding:20px;text-align:center">Actual, budget, variance and materiality are identical.</td></tr>`}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-hd"><h2>Figures that moved</h2><span class="hd-note">semantic key, not positional fact id</span></div>
+      <div class="card-bd tight">
+        <div class="tbl-wrap" style="max-height:460px;overflow:auto">
+          <table class="tbl">
+            <thead><tr><th>Kind</th><th>Figure</th><th class="num">Base</th><th class="num">Comparison</th><th class="num">Delta</th></tr></thead>
+            <tbody>${factRows || `<tr><td colspan="5" class="muted" style="padding:20px;text-align:center">Every re-derived figure is unchanged.</td></tr>`}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-hd"><h2>Commentary sections</h2><span class="hd-note">${data.sections.changed.length} changed</span></div>
+      <div class="card-bd tight">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Section</th><th>Title</th><th>What changed</th><th>Status</th></tr></thead>
+            <tbody>${sectionRows || `<tr><td colspan="4" class="muted" style="padding:20px;text-align:center">The commentary is identical.</td></tr>`}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+}
+
 function renderSignoff() {
   const { verification, run, preflight, signoff, chain, events } = S.run;
   const warns = verification.findings.filter((f) => f.severity === "warn");
@@ -977,6 +1350,8 @@ function renderSignoff() {
             : "Not recorded on this legacy record"}</dd></div>
           <div class="kv"><dt>Signed at</dt><dd>${esc(new Date(signoff.signed_at).toLocaleString())}</dd></div>
           <div class="kv"><dt>Narrative mode</dt><dd style="font-family:var(--sans)">${esc(signoff.narrative_mode)}</dd></div>
+          <div class="kv"><dt>Engine version</dt><dd class="mono">${esc(signoff.engine_version || S.run.versions?.engine || "not recorded")}</dd></div>
+          <div class="kv"><dt>Verifier version</dt><dd class="mono">${esc(signoff.verifier_version || S.run.versions?.verifier || "not recorded")}</dd></div>
           <div class="kv"><dt>Material variances signed</dt><dd>${signoff.counts.material_variances}</dd></div>
           <div class="kv"><dt>Figures verified</dt><dd>${signoff.counts.figures_verified}</dd></div>
           <div class="kv"><dt>Source figures re-derived</dt><dd>${signoff.counts.facts_rederived}</dd></div>
@@ -995,7 +1370,11 @@ function renderSignoff() {
         ${signoff.attestations.length ? `
           <hr class="rule" />
           <div class="mini-hd">Attested exceptions</div>
-          ${signoff.attestations.map((a) => `<div class="small" style="margin-bottom:7px"><span class="mono xsmall">${esc(a.finding_id)}</span> — ${esc(a.rationale)}</div>`).join("")}` : ""}
+          ${signoff.attestations.map((a) => `<div class="small" style="margin-bottom:10px">
+            <div><span class="mono xsmall">${esc(a.finding_id)}</span> · <strong>${esc(a.template || a.category || "exception")}</strong></div>
+            <div>${esc(a.rationale)}</div>
+            ${a.details && Object.keys(a.details).length ? `<div class="xsmall muted" style="margin-top:2px">${Object.entries(a.details).map(([k, v]) => `${esc(k.replace(/_/g, " "))}: ${esc(v)}`).join(" · ")}</div>` : ""}
+          </div>`).join("")}` : ""}
       </div>
 
       <div class="card">
@@ -1019,24 +1398,36 @@ function renderSignoff() {
   }
 
   const attestCards = warns.length ? warns.map((w) => {
-    const state = S.attest[w.finding_id] || { checked: false, rationale: "" };
+    const state = S.attest[w.finding_id] || { checked: false, rationale: "", details: {} };
+    const template = templateFor(w.category);
+    const details = attestationDetails(w);
+    const fieldHtml = (template.fields || []).map((field) => {
+      const value = details[field.name] || "";
+      const common = `data-attest-field="${esc(field.name)}" data-attest-id="${esc(w.finding_id)}"`;
+      if (field.auto_from_finding) {
+        return `<label class="field"><span>${esc(field.label)} (from the finding)</span><input type="text" value="${esc(value)}" readonly class="mono" /></label>`;
+      }
+      return `<label class="field"><span>${esc(field.label)}${field.required ? " *" : ""}</span>
+        <input type="${field.type === "date" ? "date" : "text"}" ${common} value="${esc(value)}" placeholder="${esc(field.placeholder || "")}" /></label>`;
+    }).join("");
     return `
       <div class="attest-item ${state.checked ? "on" : ""}" data-attest="${esc(w.finding_id)}">
         <div class="attest-top">
           <input type="checkbox" id="att-${esc(w.finding_id)}" ${state.checked ? "checked" : ""} data-attest-check="${esc(w.finding_id)}" />
           <label for="att-${esc(w.finding_id)}">
-            <div class="attest-title">${esc(w.category.replace(/_/g, " ").toLowerCase())}</div>
+            <div class="attest-title">${esc(template.label)} <span class="mono xsmall muted">${esc(w.category)}</span></div>
             <div class="attest-desc">${esc(w.message)}</div>
           </label>
         </div>
-        <textarea rows="2" placeholder="Rationale for accepting this exception…" data-attest-note="${esc(w.finding_id)}">${esc(state.rationale)}</textarea>
+        <div class="attest-template">
+          <div class="xsmall muted" style="margin-bottom:8px">${esc(template.instruction || "")}</div>
+          ${fieldHtml ? `<div class="form-row">${fieldHtml}</div>` : ""}
+          <textarea rows="2" placeholder="Rationale for accepting this exception…" data-attest-note="${esc(w.finding_id)}">${esc(state.rationale)}</textarea>
+        </div>
       </div>`;
   }).join("") : `<div class="banner banner-pass" style="margin:0"><span class="banner-icon">✓</span><div>No exceptions require attestation on this run.</div></div>`;
 
-  const attestedCount = warns.filter((w) => {
-    const a = S.attest[w.finding_id];
-    return Boolean(a && a.checked && a.rationale.trim());
-  }).length;
+  const attestedCount = warns.filter(attestationReady).length;
   const checks = preflight.checks.map((c) => {
     if (c.id !== "attestations" || !warns.length) return c;
     return {
@@ -1226,6 +1617,48 @@ async function refresh() {
   render();
 }
 
+async function loadRollforward(force = false) {
+  if (S.rollforward && !force) return;
+  S.rollforwardLoading = true;
+  try {
+    S.rollforward = await api("/api/rollforward");
+  } finally {
+    S.rollforwardLoading = false;
+  }
+}
+
+async function loadDiff(baseId, compareId) {
+  if (!baseId || !compareId || baseId === compareId) {
+    toast("Pick two different runs to compare.", "bad");
+    return;
+  }
+  S.diff.base = baseId;
+  S.diff.compare = compareId;
+  S.diff.loading = true;
+  S.diff.attempted = true;
+  render();
+  try {
+    S.diff.data = await api(`/api/runs/${baseId}/diff/${compareId}`);
+  } catch (error) {
+    S.diff.data = null;
+    toast(error.message, "bad");
+  } finally {
+    S.diff.loading = false;
+    render();
+  }
+}
+
+async function openDiff() {
+  const current = S.run.run.id;
+  const others = S.runs.filter((r) => r.id !== current);
+  const samePeriod = others.find((r) => r.period === S.run.run.period);
+  const compare = (samePeriod || others[0])?.id || null;
+  S.tab = "compare";
+  S.diff = { base: current, compare, data: null, loading: Boolean(compare), attempted: true };
+  render();
+  if (compare) await loadDiff(current, compare);
+}
+
 async function act(action, target) {
   switch (action) {
     case "tab":
@@ -1245,6 +1678,34 @@ async function act(action, target) {
       S.tab = "workbench";
       render();
       break;
+    case "wb-mode":
+      S.wb.mode = target === "rollforward" ? "rollforward" : "variance";
+      if (S.wb.mode === "rollforward" && !S.rollforward) {
+        await withBusy("rollforward", () => loadRollforward());
+      }
+      render();
+      break;
+    case "refresh-rollforward":
+      await withBusy("rollforward", () => loadRollforward(true));
+      render();
+      break;
+    case "switch-run":
+      if (!target || target === S.run.run.id) break;
+      await withBusy("switch", async () => {
+        const view = await api(`/api/runs/${target}`);
+        S.diff = { base: null, compare: null, data: null, loading: false, attempted: false };
+        applyView(view);
+      });
+      break;
+    case "open-diff":
+      await withBusy("diff", openDiff);
+      break;
+    case "load-diff":
+      await withBusy("diff", () => loadDiff(
+        $("#diff-base")?.value || S.diff.base,
+        $("#diff-compare")?.value || S.diff.compare,
+      ));
+      break;
     case "go-commentary": {
       const section = S.run.commentary.sections.find((s) => s.variance_id === target);
       S.tab = "commentary";
@@ -1263,6 +1724,7 @@ async function act(action, target) {
     case "new-run":
       await withBusy("run", async () => {
         const view = await api("/api/runs", { method: "POST", body: JSON.stringify({ mode: "strict" }) });
+        await refreshRuns();
         S.tab = "overview";
         applyView(view);
         toast("Close re-run: reconciled, narrated and verified.", "ok");
@@ -1319,7 +1781,7 @@ async function act(action, target) {
       const note = $("#signer-note")?.value?.trim() || "";
       const attestations = Object.entries(S.attest)
         .filter(([, v]) => v.checked && v.rationale.trim())
-        .map(([finding_id, v]) => ({ finding_id, rationale: v.rationale.trim() }));
+        .map(([finding_id, v]) => ({ finding_id, rationale: v.rationale.trim(), details: v.details || {} }));
       if (!signer) { toast("A signer name is required.", "bad"); return; }
       const preparer = String(S.run.run.preparer || "").trim();
       if (!S.run.run.dual_control && preparer && signer.toLowerCase() === preparer.toLowerCase()) {
@@ -1331,6 +1793,7 @@ async function act(action, target) {
           method: "POST",
           body: JSON.stringify({ signer, role, note, attestations }),
         });
+        await refreshRuns();
         applyView(view);
         S.tab = "signoff";
         render();
@@ -1348,10 +1811,7 @@ async function act(action, target) {
 function syncAttestGate() {
   const warns = S.run?.verification?.findings?.filter((f) => f.severity === "warn") || [];
   if (!warns.length) return;
-  const done = warns.filter((w) => {
-    const a = S.attest[w.finding_id];
-    return Boolean(a && a.checked && a.rationale.trim());
-  }).length;
+  const done = warns.filter(attestationReady).length;
   const complete = done === warns.length;
   const li = document.querySelector('[data-gate="attestations"]');
   if (li) {
@@ -1385,10 +1845,7 @@ function syncSignButton() {
   const btn = document.querySelector('[data-act="sign"]');
   if (!btn) return;
   const warns = S.run?.verification?.findings?.filter((f) => f.severity === "warn") || [];
-  const attested = warns.filter((w) => {
-    const a = S.attest[w.finding_id];
-    return Boolean(a && a.checked && a.rationale.trim());
-  }).length;
+  const attested = warns.filter(attestationReady).length;
   const gateBlocked = Boolean(S.run?.verification?.gate?.blocking) || attested < warns.length;
   const preparer = String(run?.preparer || "").trim();
   const signer = input ? input.value.trim() : "";
@@ -1424,6 +1881,7 @@ document.addEventListener("click", (event) => {
       "toggle-finding": actionEl.dataset.id,
       "filter-findings": actionEl.dataset.filter,
       "filter-claims": actionEl.dataset.filter,
+      "wb-mode": actionEl.dataset.mode,
     };
     act(action, targets[action]);
     return;
@@ -1447,12 +1905,31 @@ document.addEventListener("change", (event) => {
   if (id === "wb-entity") { S.wb.entity = event.target.value; render(); }
   if (id === "wb-statement") { S.wb.statement = event.target.value; render(); }
   if (id === "wb-material") { S.wb.materialOnly = event.target.checked; render(); }
+  if (id === "run-switcher") { act("switch-run", event.target.value); return; }
+  if (id === "diff-base") {
+    S.diff.base = event.target.value;
+    act("load-diff");
+    return;
+  }
+  if (id === "diff-compare") {
+    S.diff.compare = event.target.value;
+    act("load-diff");
+    return;
+  }
   const attestId = event.target.dataset?.attestCheck;
   if (attestId) {
-    S.attest[attestId] = S.attest[attestId] || { checked: false, rationale: "" };
+    S.attest[attestId] = S.attest[attestId] || { checked: false, rationale: "", details: {} };
     S.attest[attestId].checked = event.target.checked;
     const wrap = event.target.closest(".attest-item");
     if (wrap) wrap.classList.toggle("on", event.target.checked);
+    syncAttestGate();
+  }
+  const field = event.target.dataset?.attestField;
+  if (field) {
+    const findingId = event.target.dataset.attestId;
+    S.attest[findingId] = S.attest[findingId] || { checked: false, rationale: "", details: {} };
+    S.attest[findingId].details = S.attest[findingId].details || {};
+    S.attest[findingId].details[field] = event.target.value;
     syncAttestGate();
   }
 });
@@ -1467,8 +1944,16 @@ document.addEventListener("input", (event) => {
   }
   const attestId = event.target.dataset?.attestNote;
   if (attestId) {
-    S.attest[attestId] = S.attest[attestId] || { checked: false, rationale: "" };
+    S.attest[attestId] = S.attest[attestId] || { checked: false, rationale: "", details: {} };
     S.attest[attestId].rationale = event.target.value;
+    syncAttestGate();
+  }
+  const field = event.target.dataset?.attestField;
+  if (field) {
+    const findingId = event.target.dataset.attestId;
+    S.attest[findingId] = S.attest[findingId] || { checked: false, rationale: "", details: {} };
+    S.attest[findingId].details = S.attest[findingId].details || {};
+    S.attest[findingId].details[field] = event.target.value;
     syncAttestGate();
   }
   if (event.target.id === "signer-name") syncSignButton();

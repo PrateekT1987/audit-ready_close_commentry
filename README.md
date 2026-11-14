@@ -112,7 +112,17 @@ run reports how many it caught and how many figures each mutation broke
 ### 4. Sign off
 
 `app/engine/audit.py` refuses a signature unless every gate condition passes
-and every warning has been individually attested with a rationale.
+and every warning has been individually attested with a rationale. Each
+warning category has its own attestation template, so a waiver answers the
+question an auditor asks next: a control break must name the control and give a
+remediation owner and date, and a disclosure gap must name who reviewed it and
+when the narrative will be completed. A prose-only attestation is refused.
+
+Every signed record also stamps the **engine version** and **verifier version**
+that produced and cleared the commentary, and the certificate shows both.
+Without that, a later change to either stage would be invisible in the audit
+trail and a re-run could not be told apart from a re-interpretation of the same
+evidence.
 
 **Separation of duties.** The run's `run.created` event is the system of
 record for who prepared it: the event actor is the preparer of record and its
@@ -142,6 +152,27 @@ The audit trail re-hashes the live artefacts when it verifies the chain, so an
 edit to signed commentary, verification or facts is detected as a broken link —
 not just a rewritten hash field.
 
+### 5. Compare runs
+
+`app/engine/diff.py` compares two persisted runs of the same period. It indexes
+the two fact stores by semantic identity (kind, entity, account, period, basis,
+comparator and driver) rather than by fact id, and reports which figures moved
+with both values and the delta, which variances changed actual, budget,
+variance or materiality, which findings were added, cleared or reworded, and
+which commentary sections changed wording or figure citations. It then decides
+whether an existing signature still covers the comparison run: a signed base run
+is invalidated when the artefact hashes differ or its chain link no longer
+verifies. The comparison is a read model; it never mutates a run or a signature.
+
+### 6. Roll forward
+
+`app/engine/rollforward.py` reconciles every configured period through the same
+engine and pivots entity × account × period, July through October with the
+current period on the right. Entity and statement filters apply, materiality is
+based on each cell, and `GRP` rows aggregate actual, budget, variance and prior
+variance and recompute materiality at group level — a movement can sit below
+every entity threshold and still clear the group threshold.
+
 ## Run it
 
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
@@ -169,14 +200,17 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-37 tests cover the money round-trip, the quantity vocabulary, cross-section
+42 tests cover the money round-trip, the quantity vocabulary, cross-section
 driver and prose-claim reconciliation, reconcile invariants, the blocking
 trial-balance proof, sequence-ordered chain verification, period-correct
 narration, separation of duties, semantic direction and comparator parsing,
 fact-bound narration, the clean and adversarial verification outcomes, the
 fourteen-mutation self-test (including summary, compound,
-spelled-out-quantity and cross-section edits), sign-off refusal, chain tamper
-detection, evidence-pack manifests and the HTTP surface. No pytest dependency.
+spelled-out-quantity and cross-section edits), sign-off refusal, structured
+attestation templates, chain tamper detection, stable evidence-pack ids and
+per-download hashes, engine and verifier version stamps, run comparison and
+signature invalidation, the multi-period roll-forward pivot and the HTTP
+surface. No pytest dependency.
 
 ## Tour
 
@@ -192,12 +226,23 @@ detection, evidence-pack manifests and the HTTP surface. No pytest dependency.
 4. **Verification** — gate checklist, KPI strip, verifier self-test, findings
    (block/warn/info) and the full claim ledger: every figure as written next to
    its source value and pass/fail status.
-5. **Sign-off & audit** — gate conditions, per-warning attestation with
-   rationale, the signature form, and the hash-chained audit trail. After
-   signing, the certificate shows all artefact hashes and attested exceptions.
+5. **Sign-off & audit** — gate conditions, per-warning attestation with a
+   category template (control reference, remediation owner and date for a
+   control break), the signature form, and the hash-chained audit trail. After
+   signing, the certificate shows all artefact hashes, engine and verifier
+   versions and attested exceptions.
+6. **Run comparison** — pick two persisted runs and see which figures moved,
+   which findings were added or cleared, which sections changed and whether the
+   base signature still covers the comparison run.
+7. **Roll-forward** — switch the workbench between the current period and a
+   July–October period × account pivot, with entity and statement filters and
+   group rows whose materiality is recomputed at group level.
 
 Export the evidence pack (JSON, ~1.4 MB) or the review sheet (CSV, one row per
-section) from the top bar or the sign-off certificate.
+section) from the top bar or the sign-off certificate. A pack carries a stable
+`pack_id` — a hash of the signed artefacts, so two downloads of the same run
+can be shown to describe the same evidence — plus a `pack_hash` over each
+download so the bytes can be verified after transfer.
 
 ## HTTP API
 
@@ -208,6 +253,8 @@ section) from the top bar or the sign-off certificate.
 | `GET` | `/api/runs` | Recent runs |
 | `POST` | `/api/runs` | Reconcile, narrate and verify a new run (`prepared_by`, `dual_control`) |
 | `GET` | `/api/runs/{id}` | Full workpaper view |
+| `GET` | `/api/runs/{id}/diff/{other_id}` | Compare two runs (`base` vs `compare`) |
+| `GET` | `/api/rollforward` | Period × account pivot (`entity`, `statement`, `material_only`) |
 | `POST` | `/api/runs/{id}/renarrate` | Re-draft (`strict` or `drift`) and re-verify |
 | `POST` | `/api/runs/{id}/verify` | Re-run verification on the current draft |
 | `GET` | `/api/runs/{id}/facts/{fact}` | One fact plus its verification check |
@@ -233,6 +280,8 @@ app/
     narrate.py         fact-constrained claim plan (+ deliberate drift mode)
     verify.py          five verification layers + fourteen-mutation self-test
     audit.py           hashes, preflight, signature, chain, exports
+    diff.py            run comparison and signature invalidation
+    rollforward.py     multi-period pivot and period-scoped datasets
   static/
     index.html         single page
     styles.css         workpaper design system
