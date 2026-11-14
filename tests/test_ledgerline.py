@@ -8,6 +8,7 @@ chain, tamper detection and the HTTP surface end to end.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -244,6 +245,53 @@ def test_chain_links_and_detects_tamper() -> None:
     broken = json.loads(json.dumps(second))
     broken["chain_hash"] = "0" * 64
     assert audit.verify_chain([first, broken], runs)[1]["hash_ok"] is False
+
+
+def test_fact_hash_commits_to_full_derivation() -> None:
+    base = audit.hashes(RECON, STRICT, VERIFIED)
+    probes = []
+
+    def probe(ftype: str):
+        fact = next(f for f in RECON["facts"] if f["derivation"]["type"] == ftype)
+        probes.append(fact)
+
+    for kind in ("ledger_sum", "bs_closing", "plan_lookup", "driver_sum", "aggregate"):
+        probe(kind)
+
+    mutations = [
+        lambda f: f["derivation"]["lines"][0].__setitem__("je_id", "JE-FORGED"),
+        lambda f: f["derivation"].__setitem__("opening_period", "2026-01"),
+        lambda f: f["derivation"].__setitem__("rate", "9.9999"),
+        lambda f: f["derivation"].__setitem__("driver", "forged-driver"),
+        lambda f: f["derivation"]["accounts"].append(["9999", 1]),
+    ]
+    for fact, mutate in zip(probes, mutations):
+        tampered = copy.deepcopy(RECON)
+        target = next(f for f in tampered["facts"] if f["fact_id"] == fact["fact_id"])
+        mutate(target)
+        assert target["value"] == fact["value"], "probe must leave the reported value untouched"
+        changed = audit.hashes(tampered, STRICT, VERIFIED)
+        assert changed["fact_store_hash"] != base["fact_store_hash"], fact["derivation"]["type"]
+        assert changed["content_hash"] == base["content_hash"]
+        assert changed["verification_hash"] == base["verification_hash"]
+
+    # Source references are provenance too.
+    tampered = copy.deepcopy(RECON)
+    tampered["facts"][0]["source"]["ref"] = "forged reference"
+    assert audit.hashes(tampered, STRICT, VERIFIED)["fact_store_hash"] != base["fact_store_hash"]
+
+
+def test_chain_detects_derivation_edit() -> None:
+    record = _sign()
+    tampered = copy.deepcopy(RECON)
+    fact = next(f for f in tampered["facts"] if f["derivation"]["type"] == "ledger_sum")
+    fact["derivation"]["lines"][0]["je_id"] = "JE-FORGED"
+    chain = audit.verify_chain([record], {
+        "run_test": {"payload": {"recon": tampered, "commentary": STRICT, "verification": VERIFIED}},
+    })
+    assert chain[0]["hash_ok"] is True          # the signature record itself is untouched
+    assert chain[0]["content_ok"] is False      # but the live evidence no longer matches
+    assert chain[0]["status"] == "broken"
 
 
 def test_evidence_pack_manifest_matches_signature() -> None:

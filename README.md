@@ -90,6 +90,10 @@ and every warning has been individually attested with a rationale. The record
 contains:
 
 * hashes of the content, the verification report and the fact store,
+* inside the fact-store hash, each fact's **full derivation** — journal line
+  ids and amounts, FX rate, opening period, driver legs, aggregate accounts and
+  source reference — so repointing a fact at different evidence cannot leave
+  the certificate intact,
 * the attestations and the signer's note,
 * the previous record's chain hash,
 * a chain hash over all of the above.
@@ -125,7 +129,7 @@ use if missing.
 .venv/bin/python -m tests.test_ledgerline
 ```
 
-16 tests cover the money round-trip, reconcile invariants, fact-bound
+18 tests cover the money round-trip, reconcile invariants, fact-bound
 narration, the clean and adversarial verification outcomes, the six-mutation
 self-test, sign-off refusal, chain tamper detection, evidence-pack manifests
 and the HTTP surface. No pytest dependency.

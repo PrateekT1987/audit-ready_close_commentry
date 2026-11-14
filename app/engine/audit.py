@@ -54,19 +54,12 @@ def hashes(recon: dict, commentary: dict, verification: dict) -> dict:
         "closure": verification["closure"],
         "self_test": verification["self_test"],
     })
-    facts_hash = digest([
-        {
-            "fact_id": f["fact_id"],
-            "value": f["value"],
-            "unit": f["unit"],
-            "period": f["period"],
-            "basis": f["basis"],
-            "entity": f["entity"],
-            "account": f["account"],
-            "derivation": f["derivation"].get("type"),
-        }
-        for f in recon["facts"]
-    ])
+    # The fact-store hash commits to each fact's *full* provenance, not just its
+    # value: derivation lines (journal ids and amounts), FX rate, opening period,
+    # driver legs, aggregate account lists, presentation sign and source ref.
+    # Hashing only derivation.type would let a post-signoff edit repoint a fact
+    # at different journal lines that happen to total the same value.
+    facts_hash = digest(recon["facts"])
     return {
         "content_hash": content,
         "verification_hash": verification_hash,
