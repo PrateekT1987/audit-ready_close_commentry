@@ -308,3 +308,11 @@ This is a complete, runnable product demo, not a multi-tenant deployment. There
 is no authentication, the SQLite file is local, and the narration template is
 deterministic rather than an external model call. The verification and audit
 layers are real: the numbers, hashes and refusals are computed, not mocked.
+
+## Production readiness
+
+The Phase 0 decision pack — deployment model, identity, data store, runtime,
+data-flow and threat model — is in
+[`docs/production/phase-0/`](docs/production/phase-0/README.md). It is currently
+**proposed and awaiting sign-off**; the production hardening phases begin only
+after that record is approved.
