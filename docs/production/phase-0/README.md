@@ -74,3 +74,8 @@ date in `signoff.md`.
 | Phase 3 — Scale and operability | ADR-003, ADR-004 |
 | Phase 4 — Delivery and assurance | ADR-004 |
 | Phase 5 — Data product hardening | ADR-001, ADR-003 |
+
+Phase 1 is implemented and verified in the local/test profile; its control
+matrix, threat coverage, environment variables and residual risks are in
+[`../phase-1/README.md`](../phase-1/README.md). Production data remains blocked
+until the Phase 2 items listed there are delivered.

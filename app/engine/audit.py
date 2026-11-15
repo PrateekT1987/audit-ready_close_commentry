@@ -54,8 +54,9 @@ def _chain_payload(record: dict) -> dict:
     """The exact fields committed to by `chain_hash`.
 
     `sequence` is part of the payload for records that carry it, so moving a
-    record or rewriting its position invalidates the hash. Legacy records keep
-    their original payload (no sequence field) and remain verifiable.
+    record or rewriting its position invalidates the hash. Identity subjects and
+    dual-control approval details are committed only when present, so legacy
+    records keep their original payload and remain verifiable.
     """
     payload = {
         "prev": record["prev_chain_hash"],
@@ -66,7 +67,19 @@ def _chain_payload(record: dict) -> dict:
         "signer": record["signer"],
         "signed_at": record["signed_at"],
     }
-    for key in ("sequence", "preparer", "dual_control", "engine_version", "verifier_version"):
+    for key in (
+        "sequence",
+        "preparer",
+        "dual_control",
+        "engine_version",
+        "verifier_version",
+        "signer_subject",
+        "signer_issuer",
+        "preparer_subject",
+        "preparer_issuer",
+        "auth_session",
+        "dual_control_approval",
+    ):
         if key in record:
             payload[key] = record[key]
     return payload
@@ -267,6 +280,44 @@ def preflight(recon: dict, verification: dict, attestations: list[dict]) -> dict
     }
 
 
+def _validate_dual_control(
+    approval: dict | None,
+    *,
+    run_id: str,
+    preparer_subject: str,
+    signed_at: str,
+) -> dict:
+    """Validate the admin-approved exception bound into a dual-control sign-off."""
+    if not isinstance(approval, dict):
+        raise SignOffRefused(
+            "Dual control requires an admin-approved exception for this run; "
+            "a caller-supplied flag is not accepted."
+        )
+    required = ("approval_id", "approved_subject", "approved_by", "expires_at", "reason")
+    missing = [key for key in required if not str(approval.get(key, "")).strip()]
+    if missing:
+        raise SignOffRefused(
+            "The dual-control approval is incomplete: " + ", ".join(missing) + "."
+        )
+    if approval.get("run_id") and approval["run_id"] != run_id:
+        raise SignOffRefused("The dual-control approval belongs to a different run.")
+    if approval["approved_subject"] == preparer_subject:
+        raise SignOffRefused("The dual-control approver must be different from the preparer.")
+    expires = approval.get("expires_at")
+    try:
+        expires_at = datetime.fromisoformat(str(expires))
+    except ValueError as exc:
+        raise SignOffRefused("The dual-control approval expiry is not a valid timestamp.") from exc
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    signed = datetime.fromisoformat(signed_at)
+    if signed.tzinfo is None:
+        signed = signed.replace(tzinfo=timezone.utc)
+    if expires_at <= signed:
+        raise SignOffRefused("The dual-control approval has expired.")
+    return approval
+
+
 def sign(
     run: dict,
     recon: dict,
@@ -281,18 +332,50 @@ def sign(
     sequence: int,
     preparer: str = "",
     dual_control: bool = False,
+    signer_subject: str = "",
+    signer_issuer: str = "",
+    preparer_subject: str = "",
+    preparer_issuer: str = "",
+    dual_control_approval: dict | None = None,
+    session_id: str = "",
 ) -> dict:
     signer_name = signer.strip() if signer else ""
     preparer_name = preparer.strip() if preparer else ""
+    signer_subject = (signer_subject or "").strip()
+    preparer_subject = (preparer_subject or "").strip()
+
     if not signer_name:
         raise SignOffRefused("A named signer is required.")
     if not preparer_name:
         raise SignOffRefused("A preparer of record is required for separation of duties.")
-    if signer_name.casefold() == preparer_name.casefold() and not dual_control:
+    if signer_subject and not preparer_subject:
+        raise SignOffRefused(
+            "This run has no attributed preparer subject; re-open the run before signing."
+        )
+
+    if signer_subject and preparer_subject:
+        same_person = signer_subject == preparer_subject
+    else:
+        # Legacy engine callers predate subjects. Name comparison remains the
+        # fallback so historical records and unit tests keep their behaviour.
+        same_person = signer_name.casefold() == preparer_name.casefold()
+
+    if same_person and not dual_control:
         raise SignOffRefused(
             "Separation of duties: the signer must be different from the preparer "
-            f"({preparer_name}). Enable dual control on the run to waive this requirement."
+            f"({preparer_name}). Dual control needs an admin-approved exception."
         )
+
+    signed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    used_dual_control = bool(same_person and dual_control)
+    if used_dual_control and signer_subject and preparer_subject:
+        dual_control_approval = _validate_dual_control(
+            dual_control_approval,
+            run_id=run["id"],
+            preparer_subject=preparer_subject,
+            signed_at=signed_at,
+        )
+
     state = preflight(recon, verification, attestations)
     if not state["permitted"]:
         failed = [c["label"] for c in state["checks"] if not c["passed"]]
@@ -305,7 +388,6 @@ def sign(
             message += f". Attestation detail required: {detail}"
         raise SignOffRefused(message)
 
-    signed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     artefact_hashes = hashes(recon, commentary, verification)
     supplied = {a.get("finding_id"): a for a in attestations}
     witnessed: list[dict] = []
@@ -331,7 +413,7 @@ def sign(
         "period": recon["period"],
         "signer": signer_name,
         "preparer": preparer_name,
-        "dual_control": bool(dual_control),
+        "dual_control": used_dual_control,
         "role": role.strip() or "Controller",
         "signed_at": signed_at,
         "note": note.strip(),
@@ -349,6 +431,19 @@ def sign(
         "prev_chain_hash": prev_chain_hash,
         "narrative_mode": commentary["mode"],
     }
+    # Identity evidence is committed only when present, preserving the exact
+    # hash payload of records signed before attributed identity existed.
+    for key, value in (
+        ("signer_subject", signer_subject),
+        ("signer_issuer", (signer_issuer or "").strip()),
+        ("preparer_subject", preparer_subject),
+        ("preparer_issuer", (preparer_issuer or "").strip()),
+        ("auth_session", (session_id or "").strip()),
+    ):
+        if value:
+            record[key] = value
+    if used_dual_control and dual_control_approval:
+        record["dual_control_approval"] = dual_control_approval
     record["chain_hash"] = digest(_chain_payload(record))
     return record
 

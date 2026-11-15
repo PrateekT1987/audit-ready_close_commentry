@@ -5,6 +5,8 @@ const S = {
   meta: null,
   run: null,
   runs: [],
+  auth: null,
+  devIdentities: [],
   tab: "overview",
   loading: true,
   wb: { entity: "ALL", statement: "ALL", materialOnly: false, q: "", open: null, mode: "variance" },
@@ -82,15 +84,50 @@ function sevTag(sev) {
 }
 
 /* ------------------------------------------------------------------ api */
+function csrfToken() {
+  const cookie = document.cookie
+    .split("; ")
+    .find((row) => row.startsWith("ledgerline_csrf="));
+  if (cookie) return decodeURIComponent(cookie.split("=").slice(1).join("="));
+  return S.auth?.csrf_token || "";
+}
+
+function can(permission) {
+  const permissions = S.auth?.permissions || S.auth?.principal?.permissions || [];
+  return permissions.includes("*") || permissions.includes(permission);
+}
+
+function errorMessage(body, status) {
+  const error = body?.error;
+  if (error && typeof error === "object") return error.message || `Request failed (${status})`;
+  if (typeof error === "string") return error;
+  return `Request failed (${status})`;
+}
+
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  const method = (options.method || "GET").toUpperCase();
+  const headers = { ...(options.headers || {}) };
+  if (options.body != null && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    const token = csrfToken();
+    if (token) headers["X-CSRF-Token"] = token;
+  }
+  const res = await fetch(path, { credentials: "same-origin", ...options, headers });
   const text = await res.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = { raw: text }; }
-  if (!res.ok) throw new Error(body?.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const error = new Error(errorMessage(body, res.status));
+    error.status = res.status;
+    error.code = body?.error?.code || "http_error";
+    error.requestId = body?.error?.request_id || res.headers.get("X-Request-ID");
+    if (error.requestId) console.warn(`request ${error.requestId}: ${error.message}`);
+    if (res.status === 401 && S.auth?.authenticated) {
+      S.auth = { authenticated: false, auth_mode: S.auth.auth_mode, dev_identities: S.devIdentities };
+      renderLoggedOut();
+    }
+    throw error;
+  }
   return body;
 }
 
@@ -124,20 +161,102 @@ async function withBusy(label, fn) {
 /* ------------------------------------------------------------------ boot */
 async function boot() {
   try {
+    const state = await api("/api/auth/me");
+    S.auth = state;
+    S.devIdentities = state.dev_identities || [];
+    if (!state.authenticated) {
+      renderLoggedOut();
+      return;
+    }
+    document.body.classList.remove("signed-out");
     S.meta = await api("/api/meta");
     const runs = await api("/api/runs");
     S.runs = runs.runs;
     let view;
-    if (!runs.runs.length) {
+    if (!runs.runs.length && can("run:create")) {
       view = await api("/api/runs", { method: "POST", body: JSON.stringify({ mode: "strict" }) });
       S.runs = (await api("/api/runs")).runs;
-    } else {
+    } else if (runs.runs.length) {
       view = await api(`/api/runs/${runs.runs[0].id}`);
+    } else {
+      S.run = null;
+      renderNoRuns();
+      return;
     }
     applyView(view);
   } catch (error) {
-    $("#main").innerHTML = `<div class="banner banner-block"><span class="banner-icon">!</span><div><strong>Could not start the close.</strong><br />${esc(error.message)}</div></div>`;
+    if (error.status === 401) {
+      renderLoggedOut();
+      return;
+    }
+    $("#main").innerHTML = `<div class="banner banner-block"><span class="banner-icon">!</span><div><strong>Could not start the close.</strong><br />${esc(error.message)}${error.requestId ? `<br /><span class="xsmall muted">Request ${esc(error.requestId)}</span>` : ""}</div></div>`;
   }
+}
+
+function renderLoggedOut() {
+  document.body.classList.add("signed-out");
+  S.run = null;
+  $("#topbar-context").innerHTML = "";
+  $("#rail").innerHTML = "";
+  const identity = $("#topbar-identity");
+  if (identity) identity.innerHTML = "";
+  const dev = S.auth?.auth_mode === "dev" ? (S.auth.dev_identities || S.devIdentities || []) : [];
+  const authError = new URLSearchParams(window.location.search).get("auth_error");
+  $("#main").innerHTML = `
+    <div class="login-wrap">
+      <div class="login-card">
+        <div class="brand-mark login-mark">LL</div>
+        <h1>Sign in to Ledgerline</h1>
+        <p class="muted">Close commentary, verification evidence and sign-off records are restricted to authorized finance and audit staff.</p>
+        ${authError ? `<div class="banner banner-block" style="margin-bottom:16px"><span class="banner-icon">!</span><div>Sign-in could not be completed. Try again or contact the platform team.</div></div>` : ""}
+        ${S.auth?.auth_mode === "oidc" ? `
+          <a class="btn btn-primary login-sso" href="/auth/login">Sign in with corporate SSO</a>
+          <p class="xsmall muted">MFA and conditional access are enforced by the corporate identity provider.</p>
+        ` : `
+          <div class="login-divider"><span>Local development identities</span></div>
+          <div class="login-identities">
+            ${dev.map((item) => `
+              <button class="login-identity" data-act="dev-login" data-identity="${esc(item.identity)}">
+                <span class="login-name">${esc(item.display_name)}</span>
+                <span class="login-role">${esc((item.roles || []).join(" + "))}</span>
+              </button>`).join("")}
+          </div>
+          <p class="xsmall muted">Development authentication is local-only and refused in staging or production.</p>
+        `}
+      </div>
+    </div>`;
+}
+
+function renderNoRuns() {
+  document.body.classList.remove("signed-out");
+  $("#main").innerHTML = `
+    <div class="login-wrap">
+      <div class="login-card">
+        <h1>No close runs yet</h1>
+        <p class="muted">Your role can read workpapers but cannot open a new close run.</p>
+        <p class="xsmall muted">Ask a preparer or administrator to start the close.</p>
+      </div>
+    </div>`;
+}
+
+async function devLogin(identity) {
+  if (!identity) return;
+  await withBusy("login", async () => {
+    await api("/auth/dev/login", { method: "POST", body: JSON.stringify({ identity }) });
+    S.booted = false;
+    await boot();
+  });
+}
+
+async function signOut() {
+  await withBusy("logout", async () => {
+    try { await api("/auth/logout", { method: "POST" }); } catch { /* clear locally anyway */ }
+    S.auth = { authenticated: false, auth_mode: S.auth?.auth_mode || "dev", dev_identities: S.devIdentities };
+    S.runs = [];
+    S.run = null;
+    S.booted = false;
+    renderLoggedOut();
+  });
 }
 
 async function refreshRuns() {
@@ -257,7 +376,25 @@ function renderTopbar() {
       <button class="btn btn-sm btn-ghost" data-act="open-diff" ${runs.length < 2 ? "disabled" : ""}>Compare runs</button>
     </span>
   `;
-  $("#export-btn").disabled = false;
+  const principal = S.auth?.principal;
+  const devSelect = S.auth?.auth_mode === "dev" && S.devIdentities.length ? `
+    <select id="dev-identity" class="identity-switch" aria-label="Switch development identity">
+      <option value="">Switch identity…</option>
+      ${S.devIdentities.map((item) => `<option value="${esc(item.identity)}">${esc(item.display_name)} · ${esc((item.roles || []).join("+"))}</option>`).join("")}
+    </select>` : "";
+  const identity = $("#topbar-identity");
+  if (identity) {
+    identity.innerHTML = principal ? `
+      <span class="identity-block">
+        <span class="identity-name">${esc(principal.display_name)}</span>
+        <span class="identity-role">${esc((principal.roles || []).join(" · ") || "no role")}</span>
+      </span>
+      ${devSelect}
+      <button class="btn btn-sm btn-ghost" data-act="logout">Sign out</button>` : "";
+  }
+  $("#export-btn").disabled = !can("export:read");
+  const newRun = $('[data-act="new-run"]');
+  if (newRun) newRun.disabled = !can("run:create");
 }
 
 function renderRail() {
@@ -1296,6 +1433,8 @@ function renderCompare() {
 
 function renderSignoff() {
   const { verification, run, preflight, signoff, chain, events } = S.run;
+  const viewer = S.run.viewer || {};
+  const approval = run.dual_control_approval;
   const warns = verification.findings.filter((f) => f.severity === "warn");
 
   const chainRows = chain.map((link) => `
@@ -1343,10 +1482,12 @@ function renderSignoff() {
         </div>
         <div class="cert-grid">
           <div class="kv"><dt>Signed by</dt><dd style="font-family:var(--sans);font-size:12.5px">${esc(signoff.signer)}</dd></div>
+          <div class="kv"><dt>Signer identity</dt><dd class="mono xsmall">${esc(signoff.signer_subject || "legacy — name only")}</dd></div>
           <div class="kv"><dt>Prepared by</dt><dd style="font-family:var(--sans);font-size:12.5px">${esc(signoff.preparer || "—")}</dd></div>
+          <div class="kv"><dt>Preparer identity</dt><dd class="mono xsmall">${esc(signoff.preparer_subject || "legacy — name only")}</dd></div>
           <div class="kv"><dt>Role</dt><dd style="font-family:var(--sans);font-size:12.5px">${esc(signoff.role)}</dd></div>
           <div class="kv"><dt>Separation of duties</dt><dd style="font-family:var(--sans);font-size:12.5px">${signoff.preparer
-            ? (signoff.dual_control ? "Dual control — preparer also signed" : "Signer ≠ preparer")
+            ? (signoff.dual_control ? `Dual control — approved exception${signoff.dual_control_approval?.approval_id ? ` ${esc(signoff.dual_control_approval.approval_id)}` : ""}` : "Signer ≠ preparer")
             : "Not recorded on this legacy record"}</dd></div>
           <div class="kv"><dt>Signed at</dt><dd>${esc(new Date(signoff.signed_at).toLocaleString())}</dd></div>
           <div class="kv"><dt>Narrative mode</dt><dd style="font-family:var(--sans)">${esc(signoff.narrative_mode)}</dd></div>
@@ -1486,19 +1627,52 @@ function renderSignoff() {
       <div class="card-hd"><h2>Signature</h2><span class="hd-note">recorded against ${esc(run.period)}</span></div>
       <div class="card-bd">
         <div class="small muted" style="margin-bottom:12px">
-          Prepared by <strong>${esc(run.preparer || "—")}</strong>${run.dual_control
-            ? " · dual control enabled, so the preparer may also sign"
+          Prepared by <strong>${esc(run.preparer || "—")}</strong>${run.preparer_subject ? ` <span class="mono xsmall">${esc(run.preparer_subject)}</span>` : ""}${run.dual_control_approval
+            ? " · an admin-approved dual-control exception is in force"
             : " · the signer must be a different person"}.
         </div>
-        <div class="form-row">
-          <label class="field"><span>Signer name</span><input type="text" id="signer-name" placeholder="e.g. A. Mensah" /></label>
-          <label class="field"><span>Role</span><input type="text" id="signer-role" value="Group Controller" /></label>
+
+        ${approval ? `
+          <div class="banner banner-warn" style="margin-bottom:12px">
+            <span class="banner-icon">✓</span>
+            <div>
+              <strong>Dual control approved by ${esc(approval.approved_by)}</strong>
+              until ${esc(new Date(approval.expires_at).toLocaleString())}.
+              ${esc(approval.reason)}
+              <span class="mono xsmall">${esc(approval.approval_id)}</span>
+              ${viewer.can_approve_dual_control ? `<button class="btn btn-sm btn-ghost" data-act="revoke-dual">Revoke</button>` : ""}
+            </div>
+          </div>` : ""}
+
+        ${viewer.can_approve_dual_control && !approval && run.preparer_subject && viewer.subject !== run.preparer_subject ? `
+          <div class="dual-control">
+            <div class="mini-hd">Admin — approve a dual-control exception</div>
+            <p class="xsmall muted" style="margin:4px 0 10px">
+              Required only when the preparer must also sign. The reason, approver and expiry are committed into the signed record.
+            </p>
+            <label class="field"><span>Reason</span><textarea id="dc-reason" rows="2" placeholder="Why is dual control required for this close?"></textarea></label>
+            <label class="field"><span>Expires (optional, at most seven days)</span><input type="datetime-local" id="dc-expires" /></label>
+            <button class="btn btn-sm" data-act="approve-dual">Approve exception</button>
+          </div>` : ""}
+
+        <div class="signer-identity">
+          <span class="signer-avatar">${esc((viewer.display_name || "?").split(/\s+/).map((p) => p[0]).join("").slice(0, 2).toUpperCase())}</span>
+          <div>
+            <div><strong>${esc(viewer.display_name || "Not signed in")}</strong> <span class="muted">· ${esc(viewer.role_label || (viewer.roles || []).join(", "))}</span></div>
+            <div class="xsmall muted">${esc(viewer.email || "")}${viewer.subject ? ` · <span class="mono">${esc(viewer.subject)}</span>` : ""}</div>
+          </div>
         </div>
-        <div class="small" id="separation-note" hidden style="margin:-2px 0 10px"></div>
+
+        ${viewer.can_sign ? "" : `
+          <div class="banner banner-block" style="margin:12px 0">
+            <span class="banner-icon">■</span>
+            <div><strong>This account cannot sign this run.</strong> ${esc(signBlockedReason(viewer))}</div>
+          </div>`}
+
         <label class="field"><span>Note (optional, retained in the audit trail)</span><textarea id="signer-note" rows="2" placeholder="e.g. October close reviewed with the CFO; intercompany cut-off differences accepted as immaterial."></textarea></label>
         <div class="row">
-          <button class="btn btn-primary" data-act="sign" ${canSign ? "" : "disabled"}>Sign off ${esc(run.period_label)}</button>
-          <span class="small muted">Signing hashes the commentary, the verification report and the source fact store, and links to the previous sign-off.</span>
+          <button class="btn btn-primary" data-act="sign" ${canSign && viewer.can_sign ? "" : "disabled"}>Sign off ${esc(run.period_label)}</button>
+          <span class="small muted">The signature is recorded against your authenticated identity, hashes the commentary, verification report and fact store, and links to the previous sign-off.</span>
         </div>
       </div>
     </div>
@@ -1520,6 +1694,20 @@ function renderSignoff() {
       <div class="card-bd"><ul class="timeline">${timeline}</ul></div>
     </div>
   `;
+}
+
+function signBlockedReason(viewer) {
+  if (!viewer.preparer_attributed) {
+    return "This run predates attributed preparer identity; open a new run before signing.";
+  }
+  const permissions = viewer.permissions || [];
+  if (!permissions.includes("run:sign") && !permissions.includes("*")) {
+    return "Signing requires the signer role. Ask an administrator to grant it.";
+  }
+  if (viewer.same_as_preparer) {
+    return "You prepared this run. A different signer is required, or an administrator must approve a dual-control exception first.";
+  }
+  return "Signing is not available for this run.";
 }
 
 function brief(detail) {
@@ -1775,29 +1963,58 @@ async function act(action, target) {
     case "close-drawer":
       closeDrawer();
       break;
+    case "dev-login":
+      await devLogin(target);
+      break;
+    case "logout":
+      await signOut();
+      break;
+    case "approve-dual":
+      await withBusy("dual", async () => {
+        const reason = ($("#dc-reason")?.value || "").trim();
+        if (reason.length < 10) {
+          toast("Record a reason of at least 10 characters for the exception.", "bad");
+          return;
+        }
+        const expiry = $("#dc-expires")?.value;
+        const payload = { reason };
+        if (expiry) payload.expires_at = new Date(expiry).toISOString();
+        await api(`/api/runs/${S.run.run.id}/dual-control`, {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        const view = await api(`/api/runs/${S.run.run.id}`);
+        applyView(view);
+        toast("Dual-control exception approved and recorded.", "ok");
+      });
+      break;
+    case "revoke-dual":
+      await withBusy("dual", async () => {
+        await api(`/api/runs/${S.run.run.id}/dual-control`, { method: "DELETE" });
+        const view = await api(`/api/runs/${S.run.run.id}`);
+        applyView(view);
+        toast("Dual-control exception revoked.", "warn");
+      });
+      break;
     case "sign": {
-      const signer = $("#signer-name")?.value?.trim();
-      const role = $("#signer-role")?.value?.trim() || "Group Controller";
       const note = $("#signer-note")?.value?.trim() || "";
       const attestations = Object.entries(S.attest)
         .filter(([, v]) => v.checked && v.rationale.trim())
         .map(([finding_id, v]) => ({ finding_id, rationale: v.rationale.trim(), details: v.details || {} }));
-      if (!signer) { toast("A signer name is required.", "bad"); return; }
-      const preparer = String(S.run.run.preparer || "").trim();
-      if (!S.run.run.dual_control && preparer && signer.toLowerCase() === preparer.toLowerCase()) {
-        toast(`Separation of duties: ${preparer} prepared this run; a different signer is required.`, "bad");
+      if (!S.run.viewer?.can_sign) {
+        toast("This account cannot sign this run.", "bad");
         return;
       }
       await withBusy("sign", async () => {
         const view = await api(`/api/runs/${S.run.run.id}/signoff`, {
           method: "POST",
-          body: JSON.stringify({ signer, role, note, attestations }),
+          body: JSON.stringify({ note, attestations }),
         });
         await refreshRuns();
         applyView(view);
         S.tab = "signoff";
         render();
-        toast(`Signed off by ${signer}. Chain hash ${view.signoff.chain_hash.slice(0, 12)}…`, "ok");
+        toast(`Signed off by ${S.auth?.principal?.display_name || "you"}. Chain hash ${view.signoff.chain_hash.slice(0, 12)}…`, "ok");
       });
       break;
     }
@@ -1826,39 +2043,21 @@ function syncAttestGate() {
   const note = document.getElementById("gate-note");
   if (note) {
     note.textContent = complete
-      ? "Every condition is satisfied. Complete the signer details and sign below."
+      ? "Every condition is satisfied. Confirm the signer identity and sign below."
       : "Attest each warning on the right; the remaining conditions are already satisfied by the verification run.";
   }
-  const btn = document.querySelector('[data-act="sign"]');
-  if (btn) btn.disabled = Boolean(S.run.verification.gate.blocking) || !complete;
   syncSignButton();
 }
 
-/* Separation of duties is enforced by the API; this keeps the form honest so
-   the signer is told before they submit rather than after a 409. It also owns
-   the enabled state of the sign button so the attestation and separation rules
-   cannot fight over it. */
+/* The API enforces role, separation of duties and approval. This keeps the
+   button honest so the signer sees why it is unavailable before submitting. */
 function syncSignButton() {
-  const run = S.run?.run;
-  const input = document.getElementById("signer-name");
-  const note = document.getElementById("separation-note");
   const btn = document.querySelector('[data-act="sign"]');
   if (!btn) return;
   const warns = S.run?.verification?.findings?.filter((f) => f.severity === "warn") || [];
   const attested = warns.filter(attestationReady).length;
   const gateBlocked = Boolean(S.run?.verification?.gate?.blocking) || attested < warns.length;
-  const preparer = String(run?.preparer || "").trim();
-  const signer = input ? input.value.trim() : "";
-  const conflict = Boolean(preparer) && Boolean(signer)
-    && signer.toLowerCase() === preparer.toLowerCase();
-  const blocked = conflict && !run?.dual_control;
-  btn.disabled = gateBlocked || blocked;
-  if (!note) return;
-  note.hidden = !conflict;
-  note.textContent = blocked
-    ? `Separation of duties: ${signer} prepared this run. A different signer is required unless dual control is enabled on the run.`
-    : `Dual control is enabled for this run, so ${signer} may sign as both preparer and signer. The waiver is recorded on the certificate.`;
-  note.style.color = blocked ? "#8a1c1c" : "#6b4a00";
+  btn.disabled = gateBlocked || !S.run?.viewer?.can_sign;
 }
 
 /* --------------------------------------------------------------- events */
@@ -1882,6 +2081,7 @@ document.addEventListener("click", (event) => {
       "filter-findings": actionEl.dataset.filter,
       "filter-claims": actionEl.dataset.filter,
       "wb-mode": actionEl.dataset.mode,
+      "dev-login": actionEl.dataset.identity,
     };
     act(action, targets[action]);
     return;
@@ -1906,6 +2106,7 @@ document.addEventListener("change", (event) => {
   if (id === "wb-statement") { S.wb.statement = event.target.value; render(); }
   if (id === "wb-material") { S.wb.materialOnly = event.target.checked; render(); }
   if (id === "run-switcher") { act("switch-run", event.target.value); return; }
+  if (id === "dev-identity") { act("dev-login", event.target.value); return; }
   if (id === "diff-base") {
     S.diff.base = event.target.value;
     act("load-diff");
@@ -1956,7 +2157,10 @@ document.addEventListener("input", (event) => {
     S.attest[findingId].details[field] = event.target.value;
     syncAttestGate();
   }
-  if (event.target.id === "signer-name") syncSignButton();
+  if (event.target.id === "dc-reason" || event.target.id === "dc-expires") {
+    const btn = document.querySelector('[data-act="approve-dual"]');
+    if (btn) btn.disabled = ($("#dc-reason")?.value || "").trim().length < 10;
+  }
 });
 
 document.addEventListener("keydown", (event) => {

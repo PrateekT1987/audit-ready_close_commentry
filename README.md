@@ -126,12 +126,12 @@ evidence.
 
 **Separation of duties.** The run's `run.created` event is the system of
 record for who prepared it: the event actor is the preparer of record and its
-detail carries the run's `dual_control` flag. A signature is refused when the
-signer is the preparer (case-insensitive), unless the run was opened with
-`dual_control: true`. Governance is read from the append-only event stream at
-sign-off time, so a signer cannot change the preparer or waive the rule from the
-sign-off request. The preparer and the dual-control flag are committed into the
-chain hash, so neither can be rewritten after the fact.
+detail carries the preparer's immutable subject and issuer. Identity is derived
+from the authenticated session, never from the sign-off request. A signature is
+refused when the signer's subject matches the preparer's, unless an
+administrator has approved a time-boxed dual-control exception for that run. The
+preparer cannot approve their own exception, and the approval's id, approver
+subject, reason and expiry are committed into the signed record.
 
 The record contains:
 
@@ -140,8 +140,8 @@ The record contains:
   ids and amounts, FX rate, opening period, driver legs, aggregate accounts and
   source reference — so repointing a fact at different evidence cannot leave
   the certificate intact,
-* the preparer of record and the dual-control flag, so the separation exception
-  (when used) is visible on the certificate,
+* the signer and preparer subjects and issuers, so identity is provable rather
+  than typed, plus any dual-control approval that waived separation of duties,
 * the attestations and the signer's note,
 * a monotonic sequence number (`SO-0001`, `SO-0002`, …) that orders the chain
   independently of the second-resolution wall-clock timestamp,
@@ -187,6 +187,10 @@ Or manually:
 ```bash
 uv venv .venv
 uv pip install --python .venv/bin/python -r requirements.txt
+
+APP_ENV=local AUTH_MODE=dev \
+SESSION_SECRET=local-development-secret-at-least-32-chars \
+ALLOWED_HOSTS=127.0.0.1,localhost \
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 ```
 
@@ -194,13 +198,20 @@ The SQLite database is created at `data/close.db` on first request. The
 synthetic dataset (`data/dataset.json`) is generated deterministically on first
 use if missing.
 
+Local development uses `AUTH_MODE=dev`: the sign-in screen offers seeded
+identities (preparer, signer, reviewer, auditor, controller, admin), and the
+top-bar switcher changes identity without restarting. `APP_ENV=local` is the
+default. `run.sh` relies on those defaults; setting `SESSION_SECRET` keeps
+sessions across restarts.
+
 ### Tests
 
 ```bash
 .venv/bin/python -m tests.test_ledgerline
+# 50/50 tests passed
 ```
 
-42 tests cover the money round-trip, the quantity vocabulary, cross-section
+50 tests cover the money round-trip, the quantity vocabulary, cross-section
 driver and prose-claim reconciliation, reconcile invariants, the blocking
 trial-balance proof, sequence-ordered chain verification, period-correct
 narration, separation of duties, semantic direction and comparator parsing,
@@ -209,11 +220,17 @@ fourteen-mutation self-test (including summary, compound,
 spelled-out-quantity and cross-section edits), sign-off refusal, structured
 attestation templates, chain tamper detection, stable evidence-pack ids and
 per-download hashes, engine and verifier version stamps, run comparison and
-signature invalidation, the multi-period roll-forward pivot and the HTTP
-surface. No pytest dependency.
+signature invalidation, the multi-period roll-forward pivot, and the security
+perimeter: authentication, per-role authorization, CSRF, host/body/rate limits,
+request-id error envelopes, readiness, fail-closed production settings,
+admin-approved dual control and legacy-record compatibility. No pytest
+dependency. The UI is checked with `node --check app/static/app.js`.
 
 ## Tour
 
+0. **Sign in** — local development offers seeded identities; production uses
+   corporate SSO and derives roles from IdP groups. The top bar shows the
+   authenticated person and role, and a dev identity switcher.
 1. **Overview** — group P&L vs plan, KPI strip, control results, entity cards,
    and a plain-language account of how the close was produced.
 2. **Variance workbench** — 76 account variances, filterable by entity,
@@ -228,9 +245,10 @@ surface. No pytest dependency.
    its source value and pass/fail status.
 5. **Sign-off & audit** — gate conditions, per-warning attestation with a
    category template (control reference, remediation owner and date for a
-   control break), the signature form, and the hash-chained audit trail. After
-   signing, the certificate shows all artefact hashes, engine and verifier
-   versions and attested exceptions.
+   control break), the authenticated signer's identity card, and the
+   hash-chained audit trail. After signing, the certificate shows all artefact
+   hashes, signer/preparer subjects, dual-control approval (when used), engine
+   and verifier versions and attested exceptions.
 6. **Run comparison** — pick two persisted runs and see which figures moved,
    which findings were added or cleared, which sections changed and whether the
    base signature still covers the comparison run.
@@ -246,25 +264,43 @@ download so the bytes can be verified after transfer.
 
 ## HTTP API
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/health` | Liveness |
-| `GET` | `/api/meta` | Group, entities, accounts, policy, source systems |
-| `GET` | `/api/runs` | Recent runs |
-| `POST` | `/api/runs` | Reconcile, narrate and verify a new run (`prepared_by`, `dual_control`) |
-| `GET` | `/api/runs/{id}` | Full workpaper view |
-| `GET` | `/api/runs/{id}/diff/{other_id}` | Compare two runs (`base` vs `compare`) |
-| `GET` | `/api/rollforward` | Period × account pivot (`entity`, `statement`, `material_only`) |
-| `POST` | `/api/runs/{id}/renarrate` | Re-draft (`strict` or `drift`) and re-verify |
-| `POST` | `/api/runs/{id}/verify` | Re-run verification on the current draft |
-| `GET` | `/api/runs/{id}/facts/{fact}` | One fact plus its verification check |
-| `POST` | `/api/runs/{id}/signoff` | Sign, with per-warning attestations |
-| `GET` | `/api/runs/{id}/export` | Evidence pack (JSON) |
-| `GET` | `/api/runs/{id}/export.csv` | Commentary review sheet (CSV) |
-| `GET` | `/api/audit/chain` | Re-verified hash chain |
+Every financial route requires an authenticated session and a role permission.
+State-changing requests also require the `X-CSRF-Token` header. Errors use one
+envelope, `{"error": {"code", "message", "request_id"}}`, and every response
+carries `X-Request-ID`.
 
-Signed runs are frozen: re-narration, re-verification and a second signature
-are all refused with `409`.
+| Method | Path | Permission | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/health` | public | Liveness only |
+| `GET` | `/api/ready` | public | Database, dataset freshness/contract and chain integrity (`503` when unhealthy) |
+| `GET` | `/api/auth/me` | public | Session state, principal, permissions, CSRF token, dev identities |
+| `POST` | `/auth/dev/login` | dev only | Start a seeded local identity session |
+| `GET` | `/auth/login` | public | Corporate OIDC redirect (authorization code + PKCE) |
+| `GET` | `/auth/callback` | public | OIDC callback; creates the BFF session |
+| `POST` | `/auth/logout` | session | Revoke the session and clear cookies |
+| `GET` | `/api/meta` | `meta:read` | Group, entities, accounts, policy, source systems |
+| `GET` | `/api/runs` | `run:read` | Recent runs |
+| `POST` | `/api/runs` | `run:create` | Reconcile, narrate and verify a new run (`period`, `mode`) |
+| `GET` | `/api/runs/{id}` | `run:read` | Full workpaper view including viewer capabilities |
+| `GET` | `/api/runs/{id}/diff/{other_id}` | `run:read` | Compare two runs (`base` vs `compare`) |
+| `GET` | `/api/rollforward` | `run:read` | Period × account pivot (`entity`, `statement`, `material_only`) |
+| `POST` | `/api/runs/{id}/renarrate` | `run:narrate` | Re-draft (`strict` or `drift`) and re-verify |
+| `POST` | `/api/runs/{id}/verify` | `run:verify` | Re-run verification on the current draft |
+| `GET` | `/api/runs/{id}/facts/{fact}` | `fact:read` | One fact plus its verification check |
+| `POST` | `/api/runs/{id}/signoff` | `run:sign` | Sign with `note` and per-warning `attestations`; identity is server-derived |
+| `GET` | `/api/runs/{id}/dual-control` | `run:read` | Active approval and its history |
+| `POST` | `/api/runs/{id}/dual-control` | `policy:manage` | Admin approves a time-boxed exception (`reason`, optional `expires_at`) |
+| `DELETE` | `/api/runs/{id}/dual-control` | `policy:manage` | Revoke the active approval |
+| `GET` | `/api/runs/{id}/export` | `export:read` | Evidence pack (JSON) |
+| `GET` | `/api/runs/{id}/export.csv` | `export:read` | Commentary review sheet (CSV) |
+| `GET` | `/api/audit/chain` | `chain:read` | Re-verified hash chain |
+
+Signed runs are frozen: re-narration, re-verification, a second signature and a
+new dual-control approval are all refused with `409`.
+
+Configuration is environment-driven and fail-closed in staging and production.
+See [`docs/production/phase-1/`](docs/production/phase-1/README.md) for the full
+variable list, role matrix and threat coverage.
 
 ## Layout
 
@@ -273,8 +309,12 @@ app/
   config.py            entities, accounts, FX, materiality, driver taxonomy
   money.py             Decimal rendering/parsing shared by narrator and verifier
   seed.py              deterministic synthetic close
-  store.py             SQLite runs, events and sign-off records
-  main.py              FastAPI surface
+  settings.py          environment settings and fail-closed production rules
+  security.py          middleware, request ids, limits, headers, error envelope
+  auth.py              Principal, roles, sessions, CSRF, OIDC claim mapping
+  auth_routes.py       OIDC/dev login, callback, logout, session state
+  store.py             SQLite runs, events, sign-offs, sessions and approvals
+  main.py              FastAPI surface with per-route authorization
   engine/
     reconcile.py       trial balance, variances, drivers, controls, facts
     narrate.py         fact-constrained claim plan (+ deliberate drift mode)
@@ -304,8 +344,11 @@ included.
 
 ## Scope and limits
 
-This is a complete, runnable product demo, not a multi-tenant deployment. There
-is no authentication, the SQLite file is local, and the narration template is
+This is a complete, runnable product demo, not a multi-tenant deployment. The
+security perimeter is real: identity is derived from an OIDC or local-dev
+session, every financial route is authorized, and sign-off is bound to the
+authenticated subject. What remains a demo is the system of record: SQLite, an
+in-process sign-off lock and an unkeyed hash chain. The narration template is
 deterministic rather than an external model call. The verification and audit
 layers are real: the numbers, hashes and refusals are computed, not mocked.
 
@@ -315,4 +358,15 @@ The Phase 0 decision pack — deployment model, identity, data store, runtime,
 data-flow and threat model — is in
 [`docs/production/phase-0/`](docs/production/phase-0/README.md). The four
 architecture decisions and Phase 1 scope were accepted by the decision owner on
-2026-11-15; production hardening now proceeds phase by phase.
+2026-11-15.
+
+Phase 1 — the security perimeter — is implemented and verified in the
+local/test profile: see
+[`docs/production/phase-1/`](docs/production/phase-1/README.md) for the control
+matrix, threat coverage, environment variables, test evidence and residual
+risks.
+
+Production data remains blocked until Phase 2 delivers PostgreSQL with
+migrations and atomic sign-off, append-only audit tables, KMS-backed
+signatures, WORM evidence packs, encrypted backups with a tested restore, and a
+live corporate OIDC integration test.

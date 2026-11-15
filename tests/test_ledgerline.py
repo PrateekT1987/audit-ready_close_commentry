@@ -21,6 +21,13 @@ from pathlib import Path
 # The HTTP tests must not touch the workpaper database used by the dev server.
 _TMP = Path(tempfile.mkdtemp(prefix="ledgerline-tests-"))
 os.environ["FINCOM_DB"] = str(_TMP / "close.db")
+# The suite runs in the local/test security profile. Production/staging are
+# fail-closed and are covered by the settings-validation tests below.
+os.environ["APP_ENV"] = "test"
+os.environ["AUTH_MODE"] = "dev"
+os.environ["SESSION_SECRET"] = "test-session-secret-test-session-secret-123456"
+os.environ["ALLOWED_HOSTS"] = "testserver,127.0.0.1,localhost"
+os.environ["DEV_AUTH_HEADERS"] = "1"
 
 from app import config, store  # noqa: E402
 from app.engine import audit  # noqa: E402
@@ -867,20 +874,18 @@ def test_control_break_attestation_requires_remediation_details() -> None:
 
 
 def test_diff_reports_changes_and_invalidates_a_signature() -> None:
-    from fastapi.testclient import TestClient
-    from app.main import app
-
-    client = TestClient(app)
-    base = client.post("/api/runs", json={"mode": "strict", "prepared_by": "J. Okafor"}).json()
+    controller = _client("controller")
+    base = _post(controller, "/api/runs", {"mode": "strict"}).json()
     base_id = base["run"]["id"]
-    signed = client.post(f"/api/runs/{base_id}/signoff", json={
-        "signer": "A. Mensah", "attestations": _attestations(base["verification"]),
+    signer = _client("signer")
+    signed = _post(signer, f"/api/runs/{base_id}/signoff", {
+        "attestations": _attestations(base["verification"]),
     })
     assert signed.status_code == 201, signed.text
 
     # A clean re-run of the same period: identical artefacts, signature intact.
-    same = client.post("/api/runs", json={"mode": "strict", "prepared_by": "J. Okafor"}).json()
-    same_diff = client.get(f"/api/runs/{base_id}/diff/{same['run']['id']}").json()
+    same = _post(controller, "/api/runs", {"mode": "strict"}).json()
+    same_diff = controller.get(f"/api/runs/{base_id}/diff/{same['run']['id']}").json()
     assert same_diff["same_period"] is True
     assert same_diff["summary"]["facts_changed"] == 0
     assert same_diff["summary"]["findings_added"] == 0
@@ -891,8 +896,8 @@ def test_diff_reports_changes_and_invalidates_a_signature() -> None:
     assert same_diff["versions"]["verifier_changed"] is False
 
     # An adversarial re-narration changes the figures and raises findings.
-    drift = client.post("/api/runs", json={"mode": "drift", "prepared_by": "J. Okafor"}).json()
-    diff = client.get(f"/api/runs/{base_id}/diff/{drift['run']['id']}").json()
+    drift = _post(controller, "/api/runs", {"mode": "drift"}).json()
+    diff = controller.get(f"/api/runs/{base_id}/diff/{drift['run']['id']}").json()
     assert diff["summary"]["sections_changed"] >= 1
     assert diff["summary"]["findings_added"] >= 3
     assert any(f["category"] == "UNSOURCED_FIGURE" for f in diff["findings"]["added"])
@@ -907,10 +912,7 @@ def test_diff_reports_changes_and_invalidates_a_signature() -> None:
 
 
 def test_rollforward_pivots_four_periods_with_the_current_last() -> None:
-    from fastapi.testclient import TestClient
-    from app.main import app
-
-    client = TestClient(app)
+    client = _client("auditor")
     pivot = client.get("/api/rollforward").json()
     assert pivot["periods"] == config.PERIODS
     assert pivot["periods"][-1] == pivot["current_period"]
@@ -937,58 +939,148 @@ def test_rollforward_pivots_four_periods_with_the_current_last() -> None:
 
 
 # ------------------------------------------------------------- HTTP API
-def test_http_pipeline() -> None:
+def _client(identity: str = "preparer"):
     from fastapi.testclient import TestClient
     from app.main import app
 
     client = TestClient(app)
+    response = client.post("/auth/dev/login", json={"identity": identity})
+    assert response.status_code == 200, response.text
+    return client
 
-    assert client.get("/api/health").json()["ok"] is True
-    meta = client.get("/api/meta").json()
+
+def _login(client, identity: str) -> dict:
+    response = client.post("/auth/dev/login", json={"identity": identity})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _csrf(client) -> str:
+    state = client.get("/api/auth/me").json()
+    assert state["authenticated"] is True, state
+    token = state["csrf_token"]
+    assert token, state
+    return token
+
+
+def _headers(client, extra: dict | None = None) -> dict:
+    headers = {"X-CSRF-Token": _csrf(client)}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _post(client, path: str, body=None, **kwargs):
+    return client.post(path, json=body, headers=_headers(client), **kwargs)
+
+
+def _delete(client, path: str):
+    return client.delete(path, headers=_headers(client))
+
+
+def test_http_requires_authentication_and_uses_one_error_envelope() -> None:
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    anon = TestClient(app)
+    response = anon.get("/api/runs")
+    assert response.status_code == 401
+    error = response.json()["error"]
+    assert error["code"] == "authentication_required"
+    assert error["request_id"]
+    assert response.headers["X-Request-ID"] == error["request_id"]
+
+    # Liveness, readiness and auth state are public; financial routes are not.
+    assert anon.get("/api/health").json()["ok"] is True
+    assert anon.get("/api/ready").status_code == 200
+    state = anon.get("/api/auth/me").json()
+    assert state["authenticated"] is False
+    assert state["auth_mode"] == "dev"
+    assert {item["identity"] for item in state["dev_identities"]} >= {
+        "preparer", "signer", "admin",
+    }
+    assert anon.get("/api/meta").status_code == 401
+
+    shell = anon.get("/")
+    assert shell.status_code == 200
+    for header in (
+        "Content-Security-Policy",
+        "X-Content-Type-Options",
+        "Referrer-Policy",
+        "X-Frame-Options",
+        "Permissions-Policy",
+    ):
+        assert shell.headers.get(header), header
+    assert shell.headers["Cache-Control"] == "no-store"
+
+    # Documentation is available in the test profile and can be disabled.
+    assert anon.get("/openapi.json").status_code == 200
+
+    # A disallowed Host header is refused before routing.
+    assert anon.get("/api/health", headers={"Host": "evil.example"}).status_code == 400
+
+
+def test_http_pipeline() -> None:
+    preparer = _client("preparer")
+
+    assert preparer.get("/api/health").json()["ok"] is True
+    meta = preparer.get("/api/meta").json()
     assert meta["group"] == "Acme Global Holdings"
+    assert meta["auth"]["mode"] == "dev"
 
-    created = client.post("/api/runs", json={"mode": "strict"})
+    created = _post(preparer, "/api/runs", {"mode": "strict"})
     assert created.status_code == 201, created.text
     view = created.json()
     run_id = view["run"]["id"]
     assert view["run"]["status"] == "attestation"
+    assert view["run"]["preparer"] == "J. Okafor"
+    assert view["run"]["preparer_subject"] == "dev:preparer"
+    assert view["viewer"]["subject"] == "dev:preparer"
+    assert view["viewer"]["can_sign"] is False  # preparer has no signer role
     assert view["verification"]["gate"]["blocking"] == 0
-    assert client.get(f"/api/runs/{run_id}").status_code == 200
-    assert client.get("/api/runs/run_missing").status_code == 404
+    assert preparer.get(f"/api/runs/{run_id}").status_code == 200
+    assert preparer.get("/api/runs/run_missing").status_code == 404
 
     fact_id = view["recon"]["facts"][0]["fact_id"]
-    fact = client.get(f"/api/runs/{run_id}/facts/{fact_id}").json()
+    fact = preparer.get(f"/api/runs/{run_id}/facts/{fact_id}").json()
     assert fact["check"]["status"] == "pass"
 
-    # Signature refused without attestations, accepted with them.
-    warn_ids = [f["finding_id"] for f in view["verification"]["findings"] if f["severity"] == "warn"]
-    refused = client.post(f"/api/runs/{run_id}/signoff", json={
-        "signer": "A. Mensah", "role": "Group Controller", "attestations": [],
-    })
-    assert refused.status_code == 409
-    assert "attested" in refused.json()["error"]
+    # A preparer cannot sign without the signer role.
+    assert _post(preparer, f"/api/runs/{run_id}/signoff", {
+        "attestations": [],
+    }).status_code == 403
 
-    signed = client.post(f"/api/runs/{run_id}/signoff", json={
-        "signer": "A. Mensah",
-        "role": "Group Controller",
+    signer = _client("signer")
+    warn_ids = [f["finding_id"] for f in view["verification"]["findings"] if f["severity"] == "warn"]
+    refused = _post(signer, f"/api/runs/{run_id}/signoff", {"attestations": []})
+    assert refused.status_code == 409
+    assert refused.json()["error"]["code"] == "signoff_refused"
+    assert "attested" in refused.json()["error"]["message"]
+
+    signed = _post(signer, f"/api/runs/{run_id}/signoff", {
         "note": "Reviewed with the CFO.",
         "attestations": _attestations(view["verification"]),
     })
     assert signed.status_code == 201, signed.text
     signed_view = signed.json()
     assert signed_view["run"]["status"] == "signed"
+    assert signed_view["viewer"]["can_sign"] is False
+    assert signed_view["signoff"]["signer"] == "A. Mensah"
+    assert signed_view["signoff"]["signer_subject"] == "dev:signer"
+    assert signed_view["signoff"]["preparer_subject"] == "dev:preparer"
+    assert signed_view["signoff"]["dual_control"] is False
     assert signed_view["signoff"]["counts"]["warnings_attested"] == len(warn_ids)
     assert signed_view["chain"][-1]["status"] == "intact"
 
-    # A signed record is frozen.
-    assert client.post(f"/api/runs/{run_id}/renarrate", json={"mode": "strict"}).status_code == 409
-    assert client.post(f"/api/runs/{run_id}/verify").status_code == 409
-    assert client.post(f"/api/runs/{run_id}/signoff", json={
-        "signer": "Someone Else", "attestations": [],
-    }).status_code == 409
+    # A signed record is frozen: mutation routes refuse it, and a second
+    # signature is impossible even from the same signer.
+    assert _post(preparer, f"/api/runs/{run_id}/renarrate", {"mode": "strict"}).status_code == 409
+    assert _post(preparer, f"/api/runs/{run_id}/verify").status_code == 409
+    assert _post(signer, f"/api/runs/{run_id}/signoff", {"attestations": []}).status_code == 409
 
-    exported = client.get(f"/api/runs/{run_id}/export")
+    exported = signer.get(f"/api/runs/{run_id}/export")
     assert exported.status_code == 200
+    assert exported.headers["X-Pack-ID"]
     pack = exported.json()
     assert pack["manifest"]["content_hash"] == signed_view["signoff"]["hashes"]["content_hash"]
     assert pack["manifest"]["verification_hash"] == signed_view["signoff"]["hashes"]["verification_hash"]
@@ -999,90 +1091,351 @@ def test_http_pipeline() -> None:
     assert pack["chain"][-1]["status"] == "intact"
 
     # The stable id survives a second download; the per-download digest still verifies.
-    again = client.get(f"/api/runs/{run_id}/export").json()
+    again = signer.get(f"/api/runs/{run_id}/export").json()
     assert again["pack_id"] == pack["pack_id"]
     assert audit.verify_pack_hash(again)
 
-    csv = client.get(f"/api/runs/{run_id}/export.csv")
+    csv = signer.get(f"/api/runs/{run_id}/export.csv")
     assert csv.status_code == 200
     assert csv.text.splitlines()[0].startswith("section_id,variance_id")
     assert len(csv.text.splitlines()) == 14  # header + 13 sections
 
-    chain = client.get("/api/audit/chain").json()
+    chain = signer.get("/api/audit/chain").json()
     assert chain["intact"] is True
     assert chain["signoffs"][-1]["signoff_id"] == signed_view["signoff"]["signoff_id"]
 
+    # Exports are an auditable read: who exported which pack.
+    events = signer.get(f"/api/runs/{run_id}").json()["events"]
+    export_events = [e for e in events if e["action"] == "audit.exported"]
+    assert len(export_events) >= 2
+    pack_events = [e for e in export_events if e["detail"].get("format") == "evidence_pack"]
+    assert pack_events
+    assert pack_events[-1]["detail"]["actor_subject"] == "dev:signer"
+    assert pack_events[-1]["detail"]["pack_hash"]
 
-def test_http_separation_of_duties() -> None:
-    from fastapi.testclient import TestClient
-    from app.main import app
 
-    client = TestClient(app)
+def test_http_csrf_and_logout() -> None:
+    client = _client("preparer")
 
-    created = client.post("/api/runs", json={
-        "mode": "strict", "prepared_by": "P. Raghavan", "dual_control": False,
-    })
+    missing = client.post("/api/runs", json={"mode": "strict"})
+    assert missing.status_code == 403
+    assert missing.json()["error"]["code"] == "csrf_failed"
+
+    wrong = client.post(
+        "/api/runs", json={"mode": "strict"}, headers={"X-CSRF-Token": "not-the-token"}
+    )
+    assert wrong.status_code == 403
+    assert wrong.json()["error"]["code"] == "csrf_failed"
+
+    good = _post(client, "/api/runs", {"mode": "strict"})
+    assert good.status_code == 201
+
+    logout = _post(client, "/auth/logout")
+    assert logout.status_code == 200 and logout.json()["ok"] is True
+    assert client.get("/api/runs").status_code == 401
+    assert client.get("/api/auth/me").json()["authenticated"] is False
+
+
+def test_http_role_based_access_control() -> None:
+    preparer = _client("preparer")
+    run = _post(preparer, "/api/runs", {"mode": "strict"}).json()
+    run_id = run["run"]["id"]
+
+    reviewer = _client("reviewer")
+    assert reviewer.get("/api/runs").status_code == 200
+    assert reviewer.get(f"/api/runs/{run_id}").status_code == 200
+    assert _post(reviewer, "/api/runs", {"mode": "strict"}).status_code == 403
+    assert _post(reviewer, f"/api/runs/{run_id}/renarrate", {"mode": "strict"}).status_code == 403
+    assert _post(reviewer, f"/api/runs/{run_id}/signoff", {"attestations": []}).status_code == 403
+    assert reviewer.get(f"/api/runs/{run_id}/export").status_code == 403
+
+    auditor = _client("auditor")
+    assert auditor.get(f"/api/runs/{run_id}").status_code == 200
+    assert auditor.get("/api/audit/chain").status_code == 200
+    assert auditor.get(f"/api/runs/{run_id}/export").status_code == 200
+    assert _post(auditor, "/api/runs", {"mode": "strict"}).status_code == 403
+    assert _post(auditor, f"/api/runs/{run_id}/verify").status_code == 403
+    assert _post(auditor, f"/api/runs/{run_id}/signoff", {"attestations": []}).status_code == 403
+
+    # Admin is authorized for policy but the account is not a bypass around
+    # subject-based separation of duties (covered in the next test).
+    admin = _client("admin")
+    assert admin.get("/api/audit/chain").status_code == 200
+    assert _post(admin, f"/api/runs/{run_id}/dual-control", {
+        "reason": "Independent controller approval for coverage during month-end.",
+    }).status_code == 201
+
+
+def test_http_separation_of_duties_and_admin_dual_control() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    controller = _client("controller")
+    created = _post(controller, "/api/runs", {"mode": "strict"})
     assert created.status_code == 201, created.text
     view = created.json()
     run_id = view["run"]["id"]
-    assert view["run"]["preparer"] == "P. Raghavan"
-    assert view["run"]["dual_control"] is False
-    assert view["verification"]["gate"]["blocking"] == 0
-    warn_ids = [f["finding_id"] for f in view["verification"]["findings"] if f["severity"] == "warn"]
+    assert view["run"]["preparer_subject"] == "dev:controller"
     attestations = _attestations(view["verification"])
 
-    refused = client.post(f"/api/runs/{run_id}/signoff", json={
-        "signer": "p. raghavan", "attestations": attestations,
+    refused = _post(controller, f"/api/runs/{run_id}/signoff", {
+        "attestations": attestations,
     })
     assert refused.status_code == 409
-    assert "Separation of duties" in refused.json()["error"]
+    assert refused.json()["error"]["code"] == "separation_of_duties"
 
-    signed = client.post(f"/api/runs/{run_id}/signoff", json={
-        "signer": "A. Mensah", "attestations": attestations,
+    # The preparer cannot approve their own exception, and a non-admin cannot
+    # approve one either.
+    assert _post(controller, f"/api/runs/{run_id}/dual-control", {
+        "reason": "The preparer should not be able to waive their own control.",
+    }).status_code == 403
+
+    admin = _client("admin")
+    expires = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(timespec="seconds")
+    approved = _post(admin, f"/api/runs/{run_id}/dual-control", {
+        "reason": "Independent controller approval: sole preparer during close week.",
+        "expires_at": expires,
+    })
+    assert approved.status_code == 201, approved.text
+    approval = approved.json()["approval"]
+    assert approval["approved_subject"] == "dev:admin"
+    assert approval["requested_subject"] == "dev:controller"
+
+    signed = _post(controller, f"/api/runs/{run_id}/signoff", {
+        "note": "Signed under an approved dual-control exception.",
+        "attestations": attestations,
     })
     assert signed.status_code == 201, signed.text
-    signoff = signed.json()["signoff"]
-    assert signoff["signer"] == "A. Mensah"
-    assert signoff["preparer"] == "P. Raghavan"
-    assert signoff["dual_control"] is False
+    record = signed.json()["signoff"]
+    assert record["signer_subject"] == record["preparer_subject"] == "dev:controller"
+    assert record["dual_control"] is True
+    assert record["dual_control_approval"]["approval_id"] == approval["approval_id"]
+    assert record["dual_control_approval"]["approved_subject"] == "dev:admin"
     assert signed.json()["chain"][-1]["status"] == "intact"
 
-    # A dual-control run lets the preparer sign, and records the waiver.
-    dual = client.post("/api/runs", json={
-        "mode": "strict", "prepared_by": "P. Raghavan", "dual_control": True,
-    }).json()
-    dual_id = dual["run"]["id"]
-    dual_attest = _attestations(dual["verification"])
-    dual_signed = client.post(f"/api/runs/{dual_id}/signoff", json={
-        "signer": "P. Raghavan", "attestations": dual_attest,
+    # A revoked approval no longer permits a self-signature.
+    second = _post(controller, "/api/runs", {"mode": "strict"}).json()
+    second_id = second["run"]["id"]
+    assert _post(admin, f"/api/runs/{second_id}/dual-control", {
+        "reason": "Temporary approval to be revoked before signature.",
+    }).status_code == 201
+    assert _delete(admin, f"/api/runs/{second_id}/dual-control").status_code == 200
+    assert _post(controller, f"/api/runs/{second_id}/signoff", {
+        "attestations": _attestations(second["verification"]),
+    }).status_code == 409
+
+    # An admin cannot approve an exception on a run they prepared themselves.
+    own = _post(admin, "/api/runs", {"mode": "strict"}).json()
+    assert _post(admin, f"/api/runs/{own['run']['id']}/dual-control", {
+        "reason": "An approver may not also be the preparer of the same run.",
+    }).status_code == 409
+
+
+def test_http_validation_bounds_and_enum_values() -> None:
+    client = _client("preparer")
+
+    bad_period = _post(client, "/api/runs", {"mode": "strict", "period": "2026-99"})
+    assert bad_period.status_code == 422
+    assert bad_period.json()["error"]["code"] == "validation_error"
+    assert "period" in bad_period.json()["error"]["message"]
+
+    bad_mode = _post(client, "/api/runs", {"mode": "creative"})
+    assert bad_mode.status_code == 422
+
+    # Identity fields were removed from the public request schema.
+    legacy_identity = _post(client, "/api/runs", {
+        "mode": "strict", "prepared_by": "Someone Else", "dual_control": True,
     })
-    assert dual_signed.status_code == 201, dual_signed.text
-    dual_record = dual_signed.json()["signoff"]
-    assert dual_record["signer"] == dual_record["preparer"] == "P. Raghavan"
-    assert dual_record["dual_control"] is True
+    assert legacy_identity.status_code == 422
 
-    # A blank preparer is rejected when the run is opened.
-    assert client.post("/api/runs", json={"mode": "strict", "prepared_by": "  "}).status_code == 422
+    run = _post(client, "/api/runs", {"mode": "strict"}).json()
+    run_id = run["run"]["id"]
+    signer = _client("signer")
+    legacy_signer = _post(signer, f"/api/runs/{run_id}/signoff", {
+        "signer": "A. Mensah", "attestations": [],
+    })
+    assert legacy_signer.status_code == 422
+    assert "signer" in legacy_signer.json()["error"]["message"] or legacy_signer.json()["error"].get("details")
+
+    overlong = _post(signer, f"/api/runs/{run_id}/signoff", {
+        "note": "x" * 2001,
+        "attestations": [],
+    })
+    assert overlong.status_code == 422
+
+    assert client.get("/api/rollforward", params={"entity": "NOPE"}).status_code == 422
+    assert client.get("/api/rollforward", params={"statement": "XX"}).status_code == 422
 
 
-def test_http_adversarial_then_recover() -> None:
+def test_http_dev_header_identity_is_local_machine_only() -> None:
     from fastapi.testclient import TestClient
     from app.main import app
 
     client = TestClient(app)
-    run_id = client.post("/api/runs", json={"mode": "strict"}).json()["run"]["id"]
+    auditor_headers = {"X-Dev-Subject": "dev:auditor", "X-Dev-Roles": "auditor"}
+    assert client.get("/api/runs", headers=auditor_headers).status_code == 200
+    assert client.post(
+        "/api/runs", json={"mode": "strict"}, headers=auditor_headers
+    ).status_code == 403
 
-    drift = client.post(f"/api/runs/{run_id}/renarrate", json={"mode": "drift"})
-    assert drift.status_code == 200
-    drift_view = drift.json()
-    assert drift_view["run"]["status"] == "blocked"
-    assert drift_view["verification"]["gate"]["blocking"] == 3
-    assert client.post(f"/api/runs/{run_id}/verify").json()["run"]["status"] == "blocked"
+    builder_headers = {"X-Dev-Subject": "dev:controller", "X-Dev-Roles": "preparer,signer"}
+    created = client.post("/api/runs", json={"mode": "strict"}, headers=builder_headers)
+    assert created.status_code == 201, created.text
+    assert created.json()["run"]["preparer_subject"] == "dev:controller"
 
-    recovered = client.post(f"/api/runs/{run_id}/renarrate", json={"mode": "strict"}).json()
-    assert recovered["run"]["status"] == "attestation"
-    assert recovered["verification"]["gate"]["blocking"] == 0
-    assert recovered["commentary"]["drift"]["applied"] is False
+
+def test_http_body_limit_and_rate_limit_are_enforced() -> None:
+    import app.security as security
+
+    original = security.settings
+    client = _client("preparer")
+    try:
+        security.settings = original.with_overrides(max_body_bytes=2048)
+        response = client.post(
+            "/api/runs",
+            json={"mode": "strict", "period": "2026-10", "padding": "x" * 4000},
+            headers=_headers(client),
+        )
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "payload_too_large"
+    finally:
+        security.settings = original
+
+    client = _client("preparer")
+    security.limiter.reset()
+    try:
+        security.settings = original.with_overrides(rate_limit_read_per_minute=2)
+        assert client.get("/api/meta").status_code == 200
+        assert client.get("/api/meta").status_code == 200
+        limited = client.get("/api/meta")
+        assert limited.status_code == 429
+        assert limited.json()["error"]["code"] == "rate_limited"
+        assert limited.headers.get("Retry-After")
+    finally:
+        security.settings = original
+        security.limiter.reset()
+
+
+def test_readiness_reports_each_dependency() -> None:
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    response = client.get("/api/ready")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert set(body["checks"]) >= {"database", "dataset", "dataset_contract", "audit_chain"}
+    assert body["checks"]["database"]["ok"] is True
+    assert body["checks"]["audit_chain"]["ok"] is True
+
+
+def test_production_settings_fail_closed() -> None:
+    from app.settings import ConfigurationError, Settings
+
+    valid = {
+        "APP_ENV": "production",
+        "AUTH_MODE": "oidc",
+        "SESSION_SECRET": "s" * 40,
+        "ALLOWED_HOSTS": "close.example.com",
+        "PUBLIC_ORIGIN": "https://close.example.com",
+        "OIDC_ISSUER": "https://login.example.com",
+        "OIDC_CLIENT_ID": "ledgerline",
+        "OIDC_CLIENT_SECRET": "client-secret",
+        "OIDC_REDIRECT_URI": "https://close.example.com/auth/callback",
+    }
+
+    def refused(env: dict) -> None:
+        try:
+            Settings.from_env(env)
+        except ConfigurationError:
+            return
+        raise AssertionError(f"configuration should have been refused: {sorted(env)}")
+
+    refused({**valid, "AUTH_MODE": "dev"})
+    refused({k: v for k, v in valid.items() if k != "SESSION_SECRET"})
+    refused({**valid, "ALLOWED_HOSTS": "*"})
+    refused({k: v for k, v in valid.items() if k != "PUBLIC_ORIGIN"})
+    refused({**valid, "OIDC_CLIENT_SECRET": ""})
+    refused({**valid, "SECURE_COOKIES": "0"})
+    refused({**valid, "DEV_AUTH_HEADERS": "1"})
+
+    configured = Settings.from_env(valid)
+    assert configured.secure_cookies is True
+    assert configured.enable_docs is False
+    assert configured.allow_dataset_seed is False
+    assert configured.dev_auth_headers is False
+    assert configured.dataset_max_age_hours == 36
+    assert configured.auth_mode == "oidc"
+
+    local = Settings.from_env({"APP_ENV": "local", "SESSION_SECRET": "l" * 40})
+    assert local.auth_mode == "dev"
+    assert local.enable_docs is True
+    assert local.secure_cookies is False
+
+
+def test_engine_subject_dual_control_requires_an_approval() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    approval = {
+        "approval_id": "DC-test0001",
+        "run_id": "run_test",
+        "requested_by": "P. Raghavan",
+        "requested_subject": "dev:controller",
+        "approved_by": "S. Iyer",
+        "approved_subject": "dev:admin",
+        "reason": "Independent controller approval for a sole preparer.",
+        "created_at": now.isoformat(timespec="seconds"),
+        "expires_at": (now + timedelta(hours=1)).isoformat(timespec="seconds"),
+    }
+
+    def sign_with(**overrides):
+        return audit.sign(
+            {"id": "run_test"}, RECON, STRICT, VERIFIED,
+            signer="P. Raghavan", role="signer", note="",
+            attestations=_attestations(VERIFIED), prev_chain_hash="genesis", sequence=1,
+            preparer="P. Raghavan",
+            signer_subject="dev:controller", preparer_subject="dev:controller",
+            dual_control=True,
+            **overrides,
+        )
+
+    record = sign_with(dual_control_approval=approval)
+    assert record["dual_control"] is True
+    assert record["dual_control_approval"]["approval_id"] == "DC-test0001"
+    assert record["signer_subject"] == record["preparer_subject"] == "dev:controller"
+    assert record["chain_hash"] == audit.digest(audit._chain_payload(record))
+
+    try:
+        sign_with()
+    except audit.SignOffRefused as exc:
+        assert "approved exception" in str(exc)
+    else:
+        raise AssertionError("subject-based dual control without an approval was accepted")
+
+    expired = {**approval, "expires_at": (now - timedelta(minutes=1)).isoformat(timespec="seconds")}
+    try:
+        sign_with(dual_control_approval=expired)
+    except audit.SignOffRefused as exc:
+        assert "expired" in str(exc)
+    else:
+        raise AssertionError("an expired dual-control approval was accepted")
+
+    conflict = {**approval, "approved_subject": "dev:controller"}
+    try:
+        sign_with(dual_control_approval=conflict)
+    except audit.SignOffRefused as exc:
+        assert "different from the preparer" in str(exc)
+    else:
+        raise AssertionError("the preparer approved their own dual-control exception")
+
+    wrong_run = {**approval, "run_id": "run_other"}
+    try:
+        sign_with(dual_control_approval=wrong_run)
+    except audit.SignOffRefused as exc:
+        assert "different run" in str(exc)
+    else:
+        raise AssertionError("an approval for another run was accepted")
 
 
 # --------------------------------------------------------------- runner

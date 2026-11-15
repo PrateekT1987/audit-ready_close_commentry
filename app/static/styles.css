@@ -464,3 +464,58 @@ hr.rule { border: 0; border-top: 1px solid var(--line-2); margin: 14px 0; }
 tr.rf-group td { background: #fbfdfd; font-weight: 600; border-top: 1px solid var(--line); }
 .attest-template { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line-2); }
 .attest-template label.field { margin-bottom: 8px; }
+
+/* ---------- identity and sign-in ---------- */
+.topbar-identity { display: flex; align-items: center; gap: 8px; }
+.identity-block { display: flex; flex-direction: column; line-height: 1.15; text-align: right; }
+.identity-name { font-weight: 600; font-size: 12px; }
+.identity-role {
+  font-size: 10px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.identity-switch {
+  border: 1px solid var(--line); background: var(--paper); color: var(--ink-2);
+  border-radius: 2px; padding: 5px 7px; font-size: 11px; max-width: 170px;
+}
+.signed-out .rail { display: none; }
+.signed-out .shell { grid-template-columns: minmax(0, 1fr); }
+.signed-out .topbar-actions > .btn,
+.signed-out .topbar-actions .menu-wrap { display: none; }
+
+.login-wrap { min-height: calc(100vh - 100px); display: grid; place-items: center; padding: 40px 18px; }
+.login-card {
+  width: 100%; max-width: 470px; background: var(--paper);
+  border: 1px solid var(--line); border-radius: 3px; box-shadow: var(--shadow);
+  padding: 34px 34px 30px;
+}
+.login-mark { margin-bottom: 16px; }
+.login-card h1 { font-family: var(--serif); font-size: 27px; font-weight: 600; margin: 0 0 6px; }
+.login-card p { margin: 0 0 10px; }
+.login-sso { display: block; text-align: center; margin: 20px 0 10px; text-decoration: none; }
+.login-divider {
+  display: flex; align-items: center; gap: 10px; margin: 22px 0 14px;
+  color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
+}
+.login-divider::before, .login-divider::after { content: ""; height: 1px; background: var(--line); flex: 1; }
+.login-identities { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.login-identity {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 10px 12px; border: 1px solid var(--line); background: #fbfcfd;
+  border-radius: 2px; cursor: pointer; text-align: left;
+}
+.login-identity:hover { border-color: var(--accent); background: var(--accent-soft); }
+.login-name { font-weight: 600; font-size: 12.5px; }
+.login-role { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+
+.signer-identity {
+  display: flex; align-items: center; gap: 12px; margin: 4px 0 14px;
+  padding: 12px; border: 1px solid var(--line); background: #fbfcfd; border-radius: 2px;
+}
+.signer-avatar {
+  width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 600; flex: none;
+}
+.dual-control {
+  border: 1px solid var(--line); background: #fbfcfd; border-radius: 2px;
+  padding: 14px; margin: 0 0 14px;
+}
