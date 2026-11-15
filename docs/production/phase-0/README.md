@@ -1,6 +1,6 @@
 # Phase 0 — Architecture decisions and threat model
 
-**Status:** Proposed — awaiting sign-off
+**Status:** Accepted — Phase 1 authorised (decision owner, 2026-11-15)
 **Owner:** Architecture / Security
 **Applies to:** Ledgerline (`app/`), production deployment
 **Last updated:** 2026-11-15
@@ -13,10 +13,10 @@ a signed-off decision pack, not a running production system.
 
 | ID | Decision | Proposed choice | Status |
 | --- | --- | --- | --- |
-| ADR-001 | Deployment model | Single-tenant internal deployment, one instance per finance group and environment | Proposed |
-| ADR-002 | Identity and session | Corporate OIDC (reference: Microsoft Entra ID), authorization code + PKCE, backend-for-frontend session cookie, MFA at the IdP | Proposed |
-| ADR-003 | System of record | Managed PostgreSQL 16 with Alembic migrations, PITR and append-only audit tables | Proposed |
-| ADR-004 | Runtime platform | Managed containers behind TLS ingress, managed Postgres, WORM object storage, KMS/HSM, secrets manager, OTel observability | Proposed |
+| ADR-001 | Deployment model | Single-tenant internal deployment, one instance per finance group and environment | Accepted 2026-11-15 |
+| ADR-002 | Identity and session | Corporate OIDC (reference: Microsoft Entra ID), authorization code + PKCE, backend-for-frontend session cookie, MFA at the IdP | Accepted 2026-11-15 |
+| ADR-003 | System of record | Managed PostgreSQL 16 with Alembic migrations, PITR and append-only audit tables | Accepted 2026-11-15 |
+| ADR-004 | Runtime platform | Managed containers behind TLS ingress, managed Postgres, WORM object storage, KMS/HSM, secrets manager, OTel observability | Accepted 2026-11-15 |
 
 The choices are deliberately conservative: they remove the demo's largest
 production risks (self-declared identity, race-prone SQLite chain, mutable
@@ -49,15 +49,15 @@ Out of scope for Phase 0:
 - source-system connectors beyond the ingestion contract described in the
   data-flow model.
 
-## What must be true before sign-off
+## Sign-off status
 
-1. The deployment model is accepted (single-tenant vs shared).
-2. The identity provider and role mapping are accepted.
-3. PostgreSQL and the migration approach are accepted.
-4. The runtime platform and cloud/provider mapping are accepted.
-5. The data-flow model is reviewed by the finance data owner.
-6. The threat model is reviewed by security, and residual risks are accepted.
-7. Phase 1 scope and owners are recorded in the sign-off record.
+The four architecture decisions and the Phase 1 scope were accepted by the
+decision owner on 2026-11-15. The named Security, Finance and Platform
+acknowledgements are recorded at Phase 1 kickoff; see
+[`signoff.md`](signoff.md).
+
+Before production data is loaded, Phase 2 must still deliver PostgreSQL,
+atomic sign-off, KMS-backed signatures, backups and readiness checks.
 
 ## Changing a decision
 

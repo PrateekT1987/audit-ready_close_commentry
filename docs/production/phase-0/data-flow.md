@@ -1,6 +1,6 @@
 # Data-flow model — Ledgerline production target
 
-**Status:** Proposed — reviewed with the threat model
+**Status:** Accepted — 2026-11-15 (decision owner)
 **Scope:** one single-tenant deployment (ADR-001)
 **Related:** ADR-002 identity, ADR-003 data store, ADR-004 runtime
 

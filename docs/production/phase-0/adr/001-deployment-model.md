@@ -1,6 +1,6 @@
 # ADR-001 — Deployment model: single-tenant internal deployment
 
-- **Status:** Proposed
+- **Status:** Accepted by decision owner — 2026-11-15
 - **Date:** 2026-11-15
 - **Deciders:** Product owner, Finance controller, Security, Platform owner
 - **Supersedes:** none

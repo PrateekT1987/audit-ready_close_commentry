@@ -1,6 +1,6 @@
 # ADR-003 — Data store: managed PostgreSQL with an append-only audit schema
 
-- **Status:** Proposed
+- **Status:** Accepted by decision owner — 2026-11-15
 - **Date:** 2026-11-15
 - **Deciders:** Platform owner, Security, Finance controller
 - **Supersedes:** none

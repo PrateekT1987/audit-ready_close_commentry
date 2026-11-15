@@ -1,6 +1,6 @@
 # ADR-002 — Identity, session and separation of duties
 
-- **Status:** Proposed
+- **Status:** Accepted by decision owner — 2026-11-15
 - **Date:** 2026-11-15
 - **Deciders:** Security, Finance controller, Platform owner
 - **Supersedes:** none

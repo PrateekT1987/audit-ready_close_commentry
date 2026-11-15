@@ -313,6 +313,6 @@ layers are real: the numbers, hashes and refusals are computed, not mocked.
 
 The Phase 0 decision pack — deployment model, identity, data store, runtime,
 data-flow and threat model — is in
-[`docs/production/phase-0/`](docs/production/phase-0/README.md). It is currently
-**proposed and awaiting sign-off**; the production hardening phases begin only
-after that record is approved.
+[`docs/production/phase-0/`](docs/production/phase-0/README.md). The four
+architecture decisions and Phase 1 scope were accepted by the decision owner on
+2026-11-15; production hardening now proceeds phase by phase.

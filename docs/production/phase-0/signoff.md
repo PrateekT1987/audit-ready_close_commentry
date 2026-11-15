@@ -1,21 +1,22 @@
 # Phase 0 sign-off record
 
-**Status:** Awaiting signature
+**Status:** Accepted — Phase 1 authorised (decision owner, 2026-11-15)
 **Date opened:** 2026-11-15
 **Decision pack:** [README](README.md), [ADRs](adr/), [data flow](data-flow.md), [threat model](threat-model.md)
 
-Phase 0 is complete only when the decisions below are accepted and the residual
-risks are accepted by the named owners. Code changes begin in Phase 1 after this
-record is signed.
+Phase 0 is closed for the four architecture decisions. The decision owner
+accepted the pack on 2026-11-15. Named Security, Finance and Platform
+acknowledgements are recorded at Phase 1 kickoff; they do not reopen the
+architecture choice unless a superseding ADR is raised.
 
 ## 1. Decisions
 
 | ID | Decision | Proposed choice | Decision | Owner |
 | --- | --- | --- | --- | --- |
-| ADR-001 | Deployment model | Single-tenant internal deployment, separate infrastructure per environment | ☐ Accept ☐ Change | Product owner |
-| ADR-002 | Identity and session | Corporate OIDC (reference Entra ID), BFF session, MFA, RBAC, server-derived signer/preparer | ☐ Accept ☐ Change | Security |
-| ADR-003 | Data store | Managed PostgreSQL 16, Alembic, serialisable sign-off, append-only audit tables, PITR | ☐ Accept ☐ Change | Platform owner |
-| ADR-004 | Runtime and platform | Managed containers, TLS ingress, WORM object storage, KMS/HSM signatures, OTel, CI/CD | ☐ Accept ☐ Change | Platform owner |
+| ADR-001 | Deployment model | Single-tenant internal deployment, separate infrastructure per environment | ☑ Accept ☐ Change | Product owner |
+| ADR-002 | Identity and session | Corporate OIDC (reference Entra ID), BFF session, MFA, RBAC, server-derived signer/preparer | ☑ Accept ☐ Change | Security |
+| ADR-003 | Data store | Managed PostgreSQL 16, Alembic, serialisable sign-off, append-only audit tables, PITR | ☑ Accept ☐ Change | Platform owner |
+| ADR-004 | Runtime and platform | Managed containers, TLS ingress, WORM object storage, KMS/HSM signatures, OTel, CI/CD | ☑ Accept ☐ Change | Platform owner |
 
 If a decision is changed, add a superseding ADR and update the table above with a
 link. Do not edit an accepted ADR in place.
@@ -35,9 +36,13 @@ link. Do not edit an accepted ADR in place.
 | 9 | No production data will be loaded before Phase 2 exit | ADR-001, ADR-003 | Product owner | ☐ |
 | 10 | Budget/capacity for managed Postgres, KMS and WORM is approved | ADR-003/004 | Finance / Platform | ☐ |
 
+Items 2–7 and 10 are Phase 1 kickoff gates for the named owners: they confirm
+implementation readiness, budgets and control ownership. They do not reopen the
+architecture choice, which the decision owner has accepted.
+
 ## 3. Phase 1 scope approved by this sign-off
 
-Phase 1 delivers the security perimeter:
+Approved 2026-11-15. Phase 1 delivers the security perimeter:
 
 - OIDC authorization code + PKCE with BFF session, CSRF and logout;
 - server-side role mapping and per-endpoint authorization;
@@ -81,17 +86,22 @@ mitigation needs an explicit owner above.
 
 | Role | Name | Decision | Signature / approval | Date |
 | --- | --- | --- | --- | --- |
-| Product owner | | ☐ Approve ☐ Reject | | |
-| Finance controller | | ☐ Approve ☐ Reject | | |
-| Security lead | | ☐ Approve ☐ Reject | | |
-| Platform owner | | ☐ Approve ☐ Reject | | |
-| Finance data owner | | ☐ Approve ☐ Reject | | |
+| Product owner / repository owner | Repository owner (session approval) | ☑ Approve ☐ Reject | Accepted the four ADRs in the Phase 0 review | 2026-11-15 |
+| Finance controller | | ☐ Approve ☐ Reject | Pending Phase 1 kickoff | |
+| Security lead | | ☐ Approve ☐ Reject | Pending Phase 1 kickoff | |
+| Platform owner | | ☐ Approve ☐ Reject | Pending Phase 1 kickoff | |
+| Finance data owner | | ☐ Approve ☐ Reject | Pending Phase 1 kickoff | |
 
 Electronic approval in the pull request that adds this file is acceptable;
 record the approver, date and commit SHA here.
+
+**Approval evidence:** decision-owner acceptance recorded 2026-11-15 against
+commit `468ada2`. The remaining named acknowledgements are Phase 1 kickoff
+gates, not blockers to starting the provider-agnostic security work.
 
 ## 6. Change log
 
 | Date | Change | By | Commit |
 | --- | --- | --- | --- |
-| 2026-11-15 | Initial Phase 0 decision pack created | Engineering | pending |
+| 2026-11-15 | Initial Phase 0 decision pack created | Engineering | `468ada2` |
+| 2026-11-15 | Four ADRs and Phase 1 scope accepted by decision owner | Repository owner | pending |

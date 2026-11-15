@@ -1,7 +1,7 @@
 # Threat model — Ledgerline production target
 
 **Method:** STRIDE, asset-centric, with attack paths for the highest-risk cases
-**Status:** Proposed — pending security review and risk acceptance
+**Status:** Accepted for Phase 1 — 2026-11-15; named Security review is a Phase 1 kickoff gate
 **Scope:** single-tenant production deployment described in ADR-001 to ADR-004
 **Last updated:** 2026-11-15
 
