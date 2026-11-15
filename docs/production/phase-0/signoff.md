@@ -95,13 +95,14 @@ mitigation needs an explicit owner above.
 Electronic approval in the pull request that adds this file is acceptable;
 record the approver, date and commit SHA here.
 
-**Approval evidence:** decision-owner acceptance recorded 2026-11-15 against
-commit `468ada2`. The remaining named acknowledgements are Phase 1 kickoff
-gates, not blockers to starting the provider-agnostic security work.
+**Approval evidence:** decision-owner acceptance recorded 2026-11-15; decision
+pack commit `468ada2`, acceptance commit `1928df9`. The remaining named
+acknowledgements are Phase 1 kickoff gates, not blockers to starting the
+provider-agnostic security work.
 
 ## 6. Change log
 
 | Date | Change | By | Commit |
 | --- | --- | --- | --- |
 | 2026-11-15 | Initial Phase 0 decision pack created | Engineering | `468ada2` |
-| 2026-11-15 | Four ADRs and Phase 1 scope accepted by decision owner | Repository owner | pending |
+| 2026-11-15 | Four ADRs and Phase 1 scope accepted by decision owner | Repository owner | `1928df9` |
